@@ -7,24 +7,45 @@ For usage examples and flag reference, see [CLI_QUICK_REFERENCE.md](CLI_QUICK_RE
 ## Command Structure
 
 ```
-$ uv run inference-endpoint -h
+$ inference-endpoint --help
 Usage: inference-endpoint COMMAND
 
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
 │ benchmark      Run benchmarks (offline, online, from-config)                 │
+│ delete         Delete a benchmark artifact.                                  │
 │ eval           Run accuracy evaluation. (not yet implemented)                │
+│ get            Get a benchmark artifact.                                     │
 │ info           Show system information.                                      │
 │ init           Generate config template.                                     │
+│ list           List benchmark artifacts.                                     │
+│ pin            Pin a benchmark artifact.                                     │
 │ probe          Test endpoint connectivity.                                   │
+│ push           Push benchmark artifacts to the MLCommons endpoint.           │
+│ unpin          Unpin a benchmark artifact.                                   │
 │ validate-yaml  Validate YAML configuration file.                             │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
+
+**Benchmark subcommands** (`benchmark <sub>`):
 
 | Subcommand              | Purpose                             | Config source        |
 | ----------------------- | ----------------------------------- | -------------------- |
 | `benchmark offline`     | Max throughput (all queries at t=0) | CLI flags → Pydantic |
 | `benchmark online`      | Sustained QPS with load pattern     | CLI flags → Pydantic |
 | `benchmark from-config` | Run from YAML file                  | YAML → Pydantic      |
+
+**Run management subcommands** (each takes `run` as its resource type):
+
+| Subcommand   | Purpose                                         | Auth            |
+| ------------ | ----------------------------------------------- | --------------- |
+| `push run`   | Package a run folder and upload via `/push_run` | `--token` / env |
+| `list run`   | List all runs owned by the authenticated user   | `--token` / env |
+| `get run`    | Fetch a single run by `--run_id`                | `--token` / env |
+| `delete run` | Delete a run by `--run_id`                      | `--token` / env |
+| `pin run`    | Pin a run to prevent auto-expiry                | `--token` / env |
+| `unpin run`  | Unpin a run to re-enable auto-expiry            | `--token` / env |
+
+See [PUSH_RUN.md](PUSH_RUN.md) for architecture, local dev setup, and the test suite.
 
 Global options: `--version`, `-v` (INFO), `-vv` (DEBUG). Verbosity is handled by the meta-app, not `BenchmarkConfig`.
 

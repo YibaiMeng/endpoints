@@ -76,6 +76,16 @@ def launcher(
 # Benchmark subcommands — lazy-loaded from commands/benchmark/cli.py
 app.command("inference_endpoint.commands.benchmark.cli:benchmark_app", name="benchmark")
 
+# Push subcommands — lazy-loaded from commands/push/cli.py
+app.command("inference_endpoint.commands.push.cli:push_app", name="push")
+
+# Run management subcommands — lazy-loaded from commands/run/cli.py
+app.command("inference_endpoint.commands.run.cli:list_app", name="list")
+app.command("inference_endpoint.commands.run.cli:get_app", name="get")
+app.command("inference_endpoint.commands.run.cli:delete_app", name="delete")
+app.command("inference_endpoint.commands.run.cli:pin_app", name="pin")
+app.command("inference_endpoint.commands.run.cli:unpin_app", name="unpin")
+
 
 # --- Misc commands ---
 

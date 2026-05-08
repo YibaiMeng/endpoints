@@ -13,6 +13,8 @@ The command layer is split across:
 - `main.py` for top-level app setup, global flags, simple commands, and error-to-exit-code handling
 - `commands/benchmark/cli.py` for the `benchmark` subcommands (`offline`, `online`, `from-config`)
 - `commands/benchmark/execute.py` for benchmark setup, execution, and finalization
+- `commands/push/cli.py` for `push run` (archive, validate, upload)
+- `commands/run/cli.py` for `list/get/delete/pin/unpin run` (run management via the proxy API)
 - One module per simple command: `probe.py`, `info.py`, `validate.py`, `init.py`
 
 Cyclopts constructs typed config objects directly from CLI arguments, so command functions receive
@@ -27,16 +29,22 @@ already-parsed models rather than raw `argparse.Namespace` objects.
 
 ## Command Map
 
-| Subcommand              | Entry point                 | Execution module                | Status                    |
-| ----------------------- | --------------------------- | ------------------------------- | ------------------------- |
-| `benchmark offline`     | `commands/benchmark/cli.py` | `commands/benchmark/execute.py` | Implemented               |
-| `benchmark online`      | `commands/benchmark/cli.py` | `commands/benchmark/execute.py` | Implemented               |
-| `benchmark from-config` | `commands/benchmark/cli.py` | `commands/benchmark/execute.py` | Implemented               |
-| `probe`                 | `main.py`                   | `commands/probe.py`             | Implemented               |
-| `info`                  | `main.py`                   | `commands/info.py`              | Implemented               |
-| `validate-yaml`         | `main.py`                   | `commands/validate.py`          | Implemented               |
-| `init`                  | `main.py`                   | `commands/init.py`              | Implemented               |
-| `eval`                  | `main.py`                   | inline stub (`CLIError`)        | Reserved, not implemented |
+| Subcommand              | Entry point                 | Execution module                 | Status                    |
+| ----------------------- | --------------------------- | -------------------------------- | ------------------------- |
+| `benchmark offline`     | `commands/benchmark/cli.py` | `commands/benchmark/execute.py`  | Implemented               |
+| `benchmark online`      | `commands/benchmark/cli.py` | `commands/benchmark/execute.py`  | Implemented               |
+| `benchmark from-config` | `commands/benchmark/cli.py` | `commands/benchmark/execute.py`  | Implemented               |
+| `push run`              | `commands/push/cli.py`      | inline (httpx upload)            | Implemented               |
+| `list run`              | `commands/run/cli.py`       | inline (httpx GET /runs)         | Implemented               |
+| `get run`               | `commands/run/cli.py`       | inline (httpx GET /runs/{id})    | Implemented               |
+| `delete run`            | `commands/run/cli.py`       | inline (httpx DELETE /runs/{id}) | Implemented               |
+| `pin run`               | `commands/run/cli.py`       | inline (httpx PATCH /runs/{id})  | Implemented               |
+| `unpin run`             | `commands/run/cli.py`       | inline (httpx PATCH /runs/{id})  | Implemented               |
+| `probe`                 | `main.py`                   | `commands/probe.py`              | Implemented               |
+| `info`                  | `main.py`                   | `commands/info.py`               | Implemented               |
+| `validate-yaml`         | `main.py`                   | `commands/validate.py`           | Implemented               |
+| `init`                  | `main.py`                   | `commands/init.py`               | Implemented               |
+| `eval`                  | `main.py`                   | inline stub (`CLIError`)         | Reserved, not implemented |
 
 ## CLI Structure
 
@@ -53,6 +61,24 @@ inference-endpoint
   |     +-- online
   |     +-- from-config
   |
+  +-- push
+  |     +-- run   (--path, --token, --dry-run)
+  |
+  +-- list
+  |     +-- run   (--token)
+  |
+  +-- get
+  |     +-- run   (--token, --run_id)
+  |
+  +-- delete
+  |     +-- run   (--token, --run_id)
+  |
+  +-- pin
+  |     +-- run   (--token, --run_id)
+  |
+  +-- unpin
+  |     +-- run   (--token, --run_id)
+  |
   +-- probe
   +-- info
   +-- validate-yaml
@@ -60,8 +86,9 @@ inference-endpoint
   +-- eval
 ```
 
-`benchmark` is registered lazily from `commands/benchmark/cli.py`, keeping startup light for
-simple commands like `info` and `validate-yaml`.
+`benchmark`, `push`, `list`, `get`, `delete`, `pin`, and `unpin` are all registered lazily
+from their respective `cli.py` modules, keeping startup light for simple commands like `info`
+and `validate-yaml`.
 
 ## `benchmark` Command Flow
 
@@ -141,12 +168,13 @@ not been implemented yet.
 
 ## Integration Points
 
-| Dependency                  | Role                                                             |
-| --------------------------- | ---------------------------------------------------------------- |
-| `main.py`                   | App definition, logging setup, global error handling             |
-| `config/`                   | Defines CLI/YAML schema models and config loading                |
-| `dataset_manager/`          | Loads performance and accuracy datasets                          |
-| `endpoint_client/`          | Sends requests to endpoint workers                               |
-| `load_generator/session.py` | Runs the benchmark session                                       |
-| `metrics/`                  | Aggregates and reports benchmark results                         |
-| `evaluation/`               | Scores collected accuracy datasets during benchmark finalization |
+| Dependency                  | Role                                                                         |
+| --------------------------- | ---------------------------------------------------------------------------- |
+| `main.py`                   | App definition, logging setup, global error handling                         |
+| `config/`                   | Defines CLI/YAML schema models and config loading                            |
+| `dataset_manager/`          | Loads performance and accuracy datasets                                      |
+| `endpoint_client/`          | Sends requests to endpoint workers                                           |
+| `load_generator/session.py` | Runs the benchmark session                                                   |
+| `metrics/`                  | Aggregates and reports benchmark results                                     |
+| `evaluation/`               | Scores collected accuracy datasets during benchmark finalization             |
+| `api/app.py`                | FastAPI proxy server that `push/list/get/delete/pin/unpin run` commands call |

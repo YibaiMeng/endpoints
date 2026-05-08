@@ -71,6 +71,58 @@ inference-endpoint probe \
 inference-endpoint validate-yaml -c test.yaml
 ```
 
+### Run Management
+
+Push a benchmark run folder and manage existing runs via the MLCommons Endpoints API.
+All commands require `--token` (or `ENDPOINTS_TOKEN` env var) and accept `--api-url`
+(default `http://localhost:8082`).
+
+```bash
+# Push a run folder
+inference-endpoint push run \
+  --path ./my_run_folder \
+  --token <prism-api-key>
+
+# Push without uploading (dry run — validates locally, no network)
+inference-endpoint push run \
+  --path ./my_run_folder \
+  --token dummy-token \
+  --dry-run
+
+# List your runs
+inference-endpoint list run --token <prism-api-key>
+
+# Get details for a single run
+inference-endpoint get run \
+  --token <prism-api-key> \
+  --run_id <run-uuid>
+
+# Pin a run (prevent auto-expiry)
+inference-endpoint pin run \
+  --token <prism-api-key> \
+  --run_id <run-uuid>
+
+# Unpin a run
+inference-endpoint unpin run \
+  --token <prism-api-key> \
+  --run_id <run-uuid>
+
+# Delete a run
+inference-endpoint delete run \
+  --token <prism-api-key> \
+  --run_id <run-uuid>
+```
+
+Token can also be set via environment variable:
+
+```bash
+export ENDPOINTS_TOKEN=<prism-api-key>
+inference-endpoint list run
+inference-endpoint push run --path ./my_run_folder
+```
+
+See [docs/PUSH_RUN.md](PUSH_RUN.md) for local dev setup, architecture, and the full test suite.
+
 ### Utilities
 
 ```bash
