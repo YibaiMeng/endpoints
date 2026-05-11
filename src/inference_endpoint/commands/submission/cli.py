@@ -138,7 +138,8 @@ def create_submission(
     benchmark_version: str = "",
     division: str = "standardized",
     early_publish: bool = False,
-    publication_cycle: str = "",
+    publication_cycle: str | None = None,
+    target_availability_date: str | None = None,
     run_ids: list[str] | None = None,
     api_url: str = _DEFAULT_API_URL,
 ) -> None:
@@ -149,9 +150,12 @@ def create_submission(
         "benchmark_version": benchmark_version,
         "division": division,
         "early_publish": early_publish,
-        "publication_cycle": publication_cycle,
         "run_ids": run_ids or [],
     }
+    if publication_cycle is not None:
+        body["publication_cycle"] = publication_cycle
+    if target_availability_date is not None:
+        body["target_availability_date"] = target_availability_date
     resp = _post(
         f"{api_url.rstrip('/')}/submissions",
         {"token": resolved_token},
@@ -193,11 +197,18 @@ def _create_submission_cmd(
         cyclopts.Parameter(name="--early_publish", help="Allow early publication."),
     ] = False,
     publication_cycle: Annotated[
-        str,
+        str | None,
         cyclopts.Parameter(
             name="--publication_cycle", help="Publication cycle (e.g. 2025-04-C1)."
         ),
-    ],
+    ] = None,
+    target_availability_date: Annotated[
+        str | None,
+        cyclopts.Parameter(
+            name="--target_availability_date",
+            help="ISO date for target availability (e.g. 2025-06-01).",
+        ),
+    ] = None,
     run_ids: Annotated[
         list[str] | None,
         cyclopts.Parameter(name="--run_id", help="Run UUID to include. Repeatable."),
@@ -215,6 +226,7 @@ def _create_submission_cmd(
         division=division,
         early_publish=early_publish,
         publication_cycle=publication_cycle,
+        target_availability_date=target_availability_date,
         run_ids=run_ids,
         api_url=api_url,
     )

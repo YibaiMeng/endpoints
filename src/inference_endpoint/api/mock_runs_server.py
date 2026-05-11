@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local-dev mock server for the /runs API (port 8081 by default).
+"""Local-dev mock of the MLCommons Endpoints Backend (port 8081 by default).
 
-This is the raw DB layer — it has NO PRISM auth. Auth is enforced by the
-proxy API (inference_endpoint.api.app) running on port 8082.
+Simulates the backend that runs in GCP behind a proxy on port 8080.
+Has NO PRISM auth — auth is enforced by the proxy API (app.py) on port 8082.
 
 Start with:
     python -m inference_endpoint.api.mock_runs_server
 
-NOT connected to any real database — stores runs in memory only.
+Stores runs and submissions in memory only — not connected to any real database.
 """
 
 from __future__ import annotations

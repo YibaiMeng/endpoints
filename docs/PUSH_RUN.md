@@ -34,7 +34,7 @@ src/inference_endpoint/commands/push/cli.py     ← CLI: inference-endpoint push
                            │  multipart/form-data
                            ▼
 ┌──────────────────────────────────────────────────────────┐
-│        Push API proxy  (app.py on port 8082)             │
+│        Auth proxy  (app.py on port 8082)                 │
 │                                                          │
 │  ┌───────────────────────────────────────────────────┐   │
 │  │  auth.py  ─  require_auth(token)                 │   │
@@ -47,7 +47,7 @@ src/inference_endpoint/commands/push/cli.py     ← CLI: inference-endpoint push
 │  │  push_run.py                                      │   │
 │  │    extract archive → validate files               │   │
 │  │    store in GLOB_DIR                              │   │
-│  │    POST /runs?user_id=… → runs API                │   │
+│  │    POST /runs?user_id=… → backend                 │   │
 │  └───────────────────────────────────────────────────┘   │
 │                                                          │
 │  ┌───────────────────────────────────────────────────┐   │
@@ -61,9 +61,10 @@ src/inference_endpoint/commands/push/cli.py     ← CLI: inference-endpoint push
 └──────────────────────────┬───────────────────────────────┘
                            │  HTTP
                            ▼
-              ┌────────────────────────┐
-              │  Runs API  (port 8081) │  ← real DB  or  mock_runs_server.py
-              └────────────────────────┘
+              ┌──────────────────────────────────────────┐
+              │  MLCommons Endpoints Backend  (port 8080) │
+              │  GCP-hosted; local mock on port 8081      │
+              └──────────────────────────────────────────┘
 ```
 
 ---
@@ -107,7 +108,7 @@ Client request
 ## Push run flow (`POST /push_run`)
 
 ```
-CLI                       push_run.py                    Runs API (8081)
+CLI                       push_run.py                    MLCommons Endpoints Backend (8080)
  │                              │                              │
  │── POST /push_run?token=… ───►│                              │
  │   (multipart: archive file)  │                              │
@@ -138,7 +139,7 @@ CLI                       push_run.py                    Runs API (8081)
 ## Proxy routes flow (`GET|DELETE|PATCH /runs/…`)
 
 ```
-Client                    runs_proxy.py                  Runs API (8081)
+Client                    runs_proxy.py                  MLCommons Endpoints Backend (8080)
  │                              │                              │
  │── GET /runs?token=… ────────►│                              │
  │                              │── require_auth ──────────────► (PRISM)
@@ -226,29 +227,34 @@ This means proxy/push route tests only exercise _their own_ logic — not PRISM.
 
 No real credentials needed. Everything runs in-process on localhost.
 
-### Terminal 1 — mock `/runs` server (port 8081)
+### Terminal 1 — mock backend (port 8081)
+
+The real MLCommons Endpoints Backend runs in GCP on port 8080. For local dev, the mock
+simulates it on port 8081 so there is no conflict if you also have a GCP tunnel open.
 
 ```bash
 python -m inference_endpoint.api.mock_runs_server
 ```
 
 ```
-┌───────────────────────────────────────────────┐
-│  Mock /runs server — local dev only (NO AUTH)    │
-│  Listening on http://localhost:8081              │
-│  NOT connected to any real database              │
-│  Auth proxy runs separately on port 8082         │
-└───────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────┐
+│  Mock MLCommons Endpoints Backend — local dev only │
+│  Listening on http://localhost:8081  (NO AUTH)     │
+│  NOT connected to any real database                │
+│  Auth proxy runs separately on port 8082           │
+└───────────────────────────────────────────────────┘
 ```
 
-### Terminal 2 — push + proxy API (port 8082)
+### Terminal 2 — auth proxy (port 8082)
 
 ```bash
 PRISM_USER_TOKEN=<your-server-prism-token> \
+RUNS_API_BASE_URL=http://localhost:8081 \
 uvicorn inference_endpoint.api.app:app --port 8082 --reload
 ```
 
-`RUNS_API_BASE_URL` defaults to `http://localhost:8081`, so it talks to the mock automatically.
+`RUNS_API_BASE_URL` defaults to `http://localhost:8080` (the GCP proxy). Override it to
+`http://localhost:8081` when running the local mock instead.
 
 > `PRISM_USER_TOKEN` is the **server-side** bearer credential your service uses to call PRISM
 > — not a user API key. The app startup will fail loudly if it's missing.
@@ -364,7 +370,7 @@ curl -s -X PATCH "$BASE/runs/$RUN_ID/unpin?token=$TOKEN" | python3 -m json.tool
 curl -s -X DELETE "$BASE/runs/$RUN_ID?token=$TOKEN"
 ```
 
-### Inspect the mock server directly (no auth needed)
+### Inspect the mock backend directly (no auth needed)
 
 ```bash
 # All runs in the mock store
@@ -397,13 +403,13 @@ curl -s -X POST \
 
 ## 5. Environment variable reference
 
-| Variable            | Component   | Default                 | Description                                                               |
-| ------------------- | ----------- | ----------------------- | ------------------------------------------------------------------------- |
-| `PRISM_USER_TOKEN`  | API server  | _(required)_            | Server-side bearer token for calling PRISM. App startup fails if missing. |
-| `RUNS_API_BASE_URL` | API server  | `http://localhost:8081` | Base URL of the upstream `/runs` API.                                     |
-| `GLOB_DIR`          | API server  | `./glob`                | Directory where extracted run archives are stored.                        |
-| `ENDPOINTS_TOKEN`   | CLI         | _(none)_                | User PRISM API key — fallback when `--token` is not passed.               |
-| `MOCK_PORT`         | mock server | `8081`                  | Port for the mock `/runs` server.                                         |
+| Variable            | Component   | Default                 | Description                                                                                                  |
+| ------------------- | ----------- | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `PRISM_USER_TOKEN`  | API server  | _(required)_            | Server-side bearer token for calling PRISM. App startup fails if missing.                                    |
+| `RUNS_API_BASE_URL` | API server  | `http://localhost:8080` | Base URL of the MLCommons Endpoints Backend (GCP proxy on port 8080). Set to `http://localhost:8081` for the local mock. |
+| `GLOB_DIR`          | API server  | `./glob`                | Directory where extracted run archives are stored.                                                           |
+| `ENDPOINTS_TOKEN`   | CLI         | _(none)_                | User PRISM API key — fallback when `--token` is not passed.                                                  |
+| `MOCK_PORT`         | mock server | `8081`                  | Port for the local mock backend (distinct from the real GCP port 8080).                                      |
 
 ---
 
@@ -417,5 +423,5 @@ curl -s -X POST \
 | `InputValidationError: Token not authorized for the Endpoints service`           | Key was issued for a different service | Request an Endpoints-scoped key                                      |
 | `ExecutionError: Upload failed — could not reach http://localhost:8082/push_run` | Push API not running                   | Start `uvicorn inference_endpoint.api.app:app --port 8082`           |
 | `InputValidationError: Missing required files: events.jsonl`                     | Incomplete run directory               | Ensure the run completed and all output files were written           |
-| `ExecutionError: Upstream service unavailable`                                   | Mock or real runs API unreachable      | Check `RUNS_API_BASE_URL` and that the mock server is running        |
+| `ExecutionError: Upstream service unavailable`                                   | MLCommons Endpoints Backend unreachable | Check `RUNS_API_BASE_URL` and that the mock or GCP backend is reachable |
 | API tests skipped                                                                | FastAPI extras not installed           | `pip install -e ".[api,test]"` or `uv sync --extra api --extra test` |

@@ -241,9 +241,32 @@ class TestCreateSubmission:
 
     @pytest.mark.unit
     @patch("inference_endpoint.commands.submission.cli._post")
+    def test_optional_fields_omitted_when_none(self, mock_post):
+        mock_post.return_value = _mock_resp(201, _FAKE_SUB)
+        create_submission(token="tok", benchmark_version="v1")
+        _, params, body = mock_post.call_args.args
+        assert "publication_cycle" not in body
+        assert "target_availability_date" not in body
+
+    @pytest.mark.unit
+    @patch("inference_endpoint.commands.submission.cli._post")
+    def test_target_availability_date_sent_when_provided(self, mock_post):
+        mock_post.return_value = _mock_resp(201, _FAKE_SUB)
+        create_submission(
+            token="tok",
+            benchmark_version="v1",
+            publication_cycle="2025-04-C1",
+            target_availability_date="2025-06-01",
+        )
+        _, params, body = mock_post.call_args.args
+        assert body["publication_cycle"] == "2025-04-C1"
+        assert body["target_availability_date"] == "2025-06-01"
+
+    @pytest.mark.unit
+    @patch("inference_endpoint.commands.submission.cli._post")
     def test_empty_run_ids_defaults_to_list(self, mock_post):
         mock_post.return_value = _mock_resp(201, _FAKE_SUB)
-        create_submission(token="tok", benchmark_version="v1", publication_cycle="2025-04-C1")
+        create_submission(token="tok", benchmark_version="v1")
         _, params, body = mock_post.call_args.args
         assert body["run_ids"] == []
 
@@ -252,13 +275,13 @@ class TestCreateSubmission:
     def test_error_propagates(self, mock_post):
         mock_post.return_value = _mock_resp(422, {"detail": "bad payload"})
         with pytest.raises(InputValidationError, match="Validation error"):
-            create_submission(token="tok", benchmark_version="v1", publication_cycle="c1")
+            create_submission(token="tok", benchmark_version="v1")
 
     @pytest.mark.unit
     def test_missing_token_raises(self, monkeypatch):
         monkeypatch.delenv("ENDPOINTS_TOKEN", raising=False)
         with pytest.raises(InputValidationError, match="Token is required"):
-            create_submission(token=None, benchmark_version="v1", publication_cycle="c1")
+            create_submission(token=None, benchmark_version="v1")
 
 
 # ---------------------------------------------------------------------------

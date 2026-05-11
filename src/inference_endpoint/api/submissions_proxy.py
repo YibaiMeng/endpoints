@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Proxy routes for the /submissions API — authenticate with PRISM then forward upstream."""
+"""Proxy routes for /submissions — authenticate with PRISM then forward to the MLCommons Endpoints Backend."""
 
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ from inference_endpoint.api.auth import PRISMIdentity, require_auth
 
 logger = logging.getLogger(__name__)
 
-_RUNS_API_BASE_URL: str = os.environ.get(
-    "RUNS_API_BASE_URL", "http://localhost:8081"
+_BACKEND_BASE_URL: str = os.environ.get(
+    "RUNS_API_BASE_URL", "http://localhost:8080"
 ).rstrip("/")
 
 router = APIRouter(tags=["submissions"])
@@ -48,7 +48,8 @@ class _SubmissionCreate(BaseModel):
     benchmark_version: str
     division: str
     early_publish: bool
-    publication_cycle: str
+    publication_cycle: str | None = None
+    target_availability_date: str | None = None
     run_ids: list[str]
 
 
@@ -110,7 +111,7 @@ async def create_submission(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.post(
-                f"{_RUNS_API_BASE_URL}/submissions",
+                f"{_BACKEND_BASE_URL}/submissions",
                 params={"user_id": identity.user_id},
                 json=body.model_dump(),
                 timeout=30.0,
@@ -129,7 +130,7 @@ async def list_submissions(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.get(
-                f"{_RUNS_API_BASE_URL}/submissions",
+                f"{_BACKEND_BASE_URL}/submissions",
                 params={"user_id": identity.user_id},
                 timeout=30.0,
             )
@@ -148,7 +149,7 @@ async def get_submission(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.get(
-                f"{_RUNS_API_BASE_URL}/submissions/{submission_id}",
+                f"{_BACKEND_BASE_URL}/submissions/{submission_id}",
                 params={"user_id": identity.user_id, "include_runs": include_runs},
                 timeout=30.0,
             )
@@ -174,7 +175,7 @@ async def update_submission(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.patch(
-                f"{_RUNS_API_BASE_URL}/submissions/{submission_id}",
+                f"{_BACKEND_BASE_URL}/submissions/{submission_id}",
                 params={"user_id": identity.user_id},
                 json=payload,
                 timeout=30.0,
@@ -198,7 +199,7 @@ async def withdraw_submission(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.delete(
-                f"{_RUNS_API_BASE_URL}/submissions/{submission_id}",
+                f"{_BACKEND_BASE_URL}/submissions/{submission_id}",
                 params={"user_id": identity.user_id},
                 timeout=30.0,
             )

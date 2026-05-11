@@ -38,7 +38,7 @@ app = FastAPI(
     version="0.1.0",
     description=(
         "Auth proxy for pushing benchmark runs and managing them via PRISM-validated tokens. "
-        "Point RUNS_API_BASE_URL at the real DB or leave unset to use the local mock on 8081."
+        "Point RUNS_API_BASE_URL at the MLCommons Endpoints Backend (GCP, port 8080) or leave unset to use the local mock on 8081."
     ),
 )
 
@@ -58,6 +58,6 @@ async def _startup() -> None:
     _GLOB_DIR.mkdir(parents=True, exist_ok=True)
     logger.info(
         "app: startup OK (RUNS_API_BASE_URL=%s, GLOB_DIR=%s)",
-        os.environ.get("RUNS_API_BASE_URL", "http://localhost:8081"),
+        os.environ.get("RUNS_API_BASE_URL", "http://localhost:8080"),
         _GLOB_DIR,
     )

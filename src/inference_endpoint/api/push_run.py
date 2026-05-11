@@ -36,8 +36,8 @@ from inference_endpoint.api.auth import PRISMIdentity, require_auth
 
 logger = logging.getLogger(__name__)
 
-_RUNS_API_BASE_URL: str = os.environ.get(
-    "RUNS_API_BASE_URL", "http://localhost:8081"
+_BACKEND_BASE_URL: str = os.environ.get(
+    "RUNS_API_BASE_URL", "http://localhost:8080"
 ).rstrip("/")
 _GLOB_DIR: Path = Path(os.environ.get("GLOB_DIR", "./glob"))
 
@@ -194,7 +194,7 @@ async def push_run(
     archive: UploadFile,
     identity: PRISMIdentity = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Accept a run archive and forward it to the runs API."""
+    """Accept a run archive and forward it to the MLCommons Endpoints Backend."""
     logger.info(
         "push_run: auth OK — user_id=%s email=%s", identity.user_id, identity.email
     )
@@ -275,7 +275,7 @@ async def push_run(
         concurrency=concurrency,
     )
 
-    upstream_url = f"{_RUNS_API_BASE_URL}/runs"
+    upstream_url = f"{_BACKEND_BASE_URL}/runs"
     logger.info(
         "push_run: forwarding to upstream %s (user_id=%s)", upstream_url, identity.user_id
     )
@@ -292,7 +292,7 @@ async def push_run(
             logger.error("push_run: upstream unreachable — %s", exc)
             raise HTTPException(
                 http_status.HTTP_502_BAD_GATEWAY,
-                detail=f"Failed to create run: runs API unreachable — {exc}",
+                detail=f"Failed to create run: MLCommons Endpoints Backend unreachable — {exc}",
             ) from exc
 
     logger.info(
@@ -313,7 +313,7 @@ async def push_run(
         raise HTTPException(
             http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
-                "detail": "Run creation failed — payload rejected by runs API",
+                "detail": "Run creation failed — payload rejected by MLCommons Endpoints Backend",
                 "upstream_errors": upstream_errors,
             },
         )

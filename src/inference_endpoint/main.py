@@ -79,22 +79,22 @@ def launcher(
 
 
 # Benchmark subcommands — lazy-loaded from commands/benchmark/cli.py
-app.command("inference_endpoint.commands.benchmark.cli:benchmark_app", name="benchmark")
+app.command("inference_endpoint.commands.benchmark.cli:benchmark_app", name="benchmark", help="Run benchmarks.")
 
 # Push subcommands — lazy-loaded from commands/push/cli.py
-app.command("inference_endpoint.commands.push.cli:push_app", name="push")
+app.command("inference_endpoint.commands.push.cli:push_app", name="push", help="Push benchmark artifacts to the MLCommons endpoint.")
 
 # Run management subcommands — lazy-loaded from commands/run/cli.py
-app.command("inference_endpoint.commands.run.cli:list_app", name="list")
-app.command("inference_endpoint.commands.run.cli:get_app", name="get")
-app.command("inference_endpoint.commands.run.cli:delete_app", name="delete")
-app.command("inference_endpoint.commands.run.cli:pin_app", name="pin")
-app.command("inference_endpoint.commands.run.cli:unpin_app", name="unpin")
+app.command("inference_endpoint.commands.run.cli:list_app", name="list", help="List benchmark artifacts.")
+app.command("inference_endpoint.commands.run.cli:get_app", name="get", help="Get a benchmark artifact.")
+app.command("inference_endpoint.commands.run.cli:delete_app", name="delete", help="Delete a benchmark artifact.")
+app.command("inference_endpoint.commands.run.cli:pin_app", name="pin", help="Pin a benchmark artifact to prevent auto-expiry.")
+app.command("inference_endpoint.commands.run.cli:unpin_app", name="unpin", help="Unpin a benchmark artifact to re-enable auto-expiry.")
 
 # Submission management subcommands — lazy-loaded from commands/submission/cli.py
-app.command("inference_endpoint.commands.submission.cli:create_app", name="create")
-app.command("inference_endpoint.commands.submission.cli:update_app", name="update")
-app.command("inference_endpoint.commands.submission.cli:withdraw_app", name="withdraw")
+app.command("inference_endpoint.commands.submission.cli:create_app", name="create", help="Create a benchmark artifact.")
+app.command("inference_endpoint.commands.submission.cli:update_app", name="update", help="Update a benchmark artifact.")
+app.command("inference_endpoint.commands.submission.cli:withdraw_app", name="withdraw", help="Withdraw a benchmark artifact.")
 
 
 # --- Misc commands ---

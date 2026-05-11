@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Proxy routes for the /runs API — authenticate with PRISM then forward upstream."""
+"""Proxy routes for /runs — authenticate with PRISM then forward to the MLCommons Endpoints Backend."""
 
 from __future__ import annotations
 
@@ -28,8 +28,8 @@ from inference_endpoint.api.auth import PRISMIdentity, require_auth
 
 logger = logging.getLogger(__name__)
 
-_RUNS_API_BASE_URL: str = os.environ.get(
-    "RUNS_API_BASE_URL", "http://localhost:8081"
+_BACKEND_BASE_URL: str = os.environ.get(
+    "RUNS_API_BASE_URL", "http://localhost:8080"
 ).rstrip("/")
 
 router = APIRouter(tags=["runs"])
@@ -40,10 +40,10 @@ router = APIRouter(tags=["runs"])
 
 
 def _upstream_error(exc: httpx.RequestError, route: str) -> HTTPException:
-    logger.error("Runs API unreachable (%s): %s", route, exc)
+    logger.error("MLCommons Endpoints Backend unreachable (%s): %s", route, exc)
     return HTTPException(
         http_status.HTTP_502_BAD_GATEWAY,
-        detail=f"Runs API unavailable: {exc}",
+        detail=f"MLCommons Endpoints Backend unavailable: {exc}",
     )
 
 
@@ -68,7 +68,7 @@ async def list_runs(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.get(
-                f"{_RUNS_API_BASE_URL}/runs",
+                f"{_BACKEND_BASE_URL}/runs",
                 params={"user_id": identity.user_id},
                 timeout=30.0,
             )
@@ -86,7 +86,7 @@ async def get_run(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.get(
-                f"{_RUNS_API_BASE_URL}/runs/{run_id}",
+                f"{_BACKEND_BASE_URL}/runs/{run_id}",
                 headers={"X-User-Id": identity.user_id},
                 timeout=30.0,
             )
@@ -104,7 +104,7 @@ async def delete_run(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.delete(
-                f"{_RUNS_API_BASE_URL}/runs/{run_id}",
+                f"{_BACKEND_BASE_URL}/runs/{run_id}",
                 headers={"X-User-Id": identity.user_id},
                 timeout=30.0,
             )
@@ -122,7 +122,7 @@ async def pin_run(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.patch(
-                f"{_RUNS_API_BASE_URL}/runs/{run_id}/pin",
+                f"{_BACKEND_BASE_URL}/runs/{run_id}/pin",
                 params={"user_id": identity.user_id},
                 timeout=30.0,
             )
@@ -140,7 +140,7 @@ async def unpin_run(
     async with httpx.AsyncClient() as client:
         try:
             upstream = await client.patch(
-                f"{_RUNS_API_BASE_URL}/runs/{run_id}/unpin",
+                f"{_BACKEND_BASE_URL}/runs/{run_id}/unpin",
                 params={"user_id": identity.user_id},
                 timeout=30.0,
             )
