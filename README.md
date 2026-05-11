@@ -97,6 +97,117 @@ The hot path is optimized for minimal overhead:
 - Custom HTTP connection pooling with `httptools` parser
 - CPU affinity support for performance tuning
 
+## Run Management
+
+Benchmark results can be pushed to the MLCommons endpoint service and managed with the `push`, `list`, `get`, `delete`, `pin`, and `unpin` subcommands. See [Submission Management](#submission-management) for grouping runs into submissions.
+
+### Setup
+
+Start the local proxy (requires the `api` extra: `pip install -e ".[api]"`):
+
+```bash
+PRISM_USER_TOKEN=<your-prism-token> \
+RUNS_API_BASE_URL=http://localhost:8080 \
+python -m uvicorn inference_endpoint.api.app:app --port 8082
+```
+
+Export your API token so you don't have to pass `--token` every time:
+
+```bash
+export ENDPOINTS_TOKEN="mlc_your_token_here"
+```
+
+### Push a run
+
+```bash
+# Dry run — validates the archive without uploading
+uv run inference-endpoint push run --path logs/my_run --dry-run
+
+# Upload
+uv run inference-endpoint push run --path logs/my_run
+```
+
+### Inspect runs
+
+```bash
+# Pretty table (default)
+uv run inference-endpoint list run
+
+# Raw JSON
+uv run inference-endpoint list run -j
+
+# Detailed view of a single run
+uv run inference-endpoint get run --run_id <id>
+
+# Raw JSON
+uv run inference-endpoint get run --run_id <id> -j
+```
+
+### Manage runs
+
+```bash
+uv run inference-endpoint pin    run --run_id <id>   # prevent auto-expiry
+uv run inference-endpoint unpin  run --run_id <id>   # re-enable auto-expiry
+uv run inference-endpoint delete run --run_id <id>
+```
+
+## Submission Management
+
+Create and manage MLCommons submissions that bundle one or more benchmark runs.
+
+### Create a submission
+
+```bash
+uv run inference-endpoint create submission \
+  --benchmark_version a1b2c3d \
+  --publication_cycle 2025-04-C1 \
+  --run_id <run-id-1> \
+  --run_id <run-id-2>
+```
+
+Optional flags: `--availability available` (default), `--division standardized` (default), `--early_publish` (flag).
+
+### Inspect submissions
+
+```bash
+# Pretty table (default)
+uv run inference-endpoint list submission
+
+# Raw JSON
+uv run inference-endpoint list submission -j
+
+# Detailed view of a single submission (includes embedded run details)
+uv run inference-endpoint get submission --submission_id <id>
+
+# Without embedded runs
+uv run inference-endpoint get submission --submission_id <id> --include_runs false
+
+# Raw JSON
+uv run inference-endpoint get submission --submission_id <id> -j
+```
+
+### Update a submission
+
+```bash
+# Update status
+uv run inference-endpoint update submission --submission_id <id> --status PEER_REVIEW_PENDING
+
+# Link a GitHub PR
+uv run inference-endpoint update submission --submission_id <id> \
+  --pr_url https://github.com/mlcommons/submissions/pull/42 \
+  --pr_number 42
+
+# Record compliance approval
+uv run inference-endpoint update submission --submission_id <id> \
+  --compliance_passed_at 2025-05-01T14:30:00
+```
+
+### Withdraw a submission
+
+```bash
+uv run inference-endpoint withdraw submission --submission_id <id>
+```
+
 ## Accuracy Evaluation
 
 Run accuracy evaluation with Pass@1 scoring using pre-defined benchmarks:

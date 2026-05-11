@@ -29,6 +29,7 @@ from fastapi import FastAPI
 from inference_endpoint.api.push_run import _GLOB_DIR
 from inference_endpoint.api.push_run import router as push_router
 from inference_endpoint.api.runs_proxy import router as runs_proxy_router
+from inference_endpoint.api.submissions_proxy import router as submissions_proxy_router
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ app = FastAPI(
 
 app.include_router(push_router)
 app.include_router(runs_proxy_router)
+app.include_router(submissions_proxy_router)
 
 
 @app.on_event("startup")

@@ -16,8 +16,13 @@
 
 """Main entry point — app definition, error formatter, command registration, and dispatch.
 
-Benchmark commands are in commands/benchmark/cli.py (lazy-loaded).
-Simple commands (probe, info, validate-yaml, init, eval) are defined here.
+Lazy-loaded command groups:
+  benchmark  — commands/benchmark/cli.py
+  push       — commands/push/cli.py
+  list/get/delete/pin/unpin — commands/run/cli.py (runs + submissions)
+  create/update/withdraw    — commands/submission/cli.py
+
+Simple commands (probe, info, validate-yaml, init, eval) are defined inline.
 """
 
 from __future__ import annotations
@@ -85,6 +90,11 @@ app.command("inference_endpoint.commands.run.cli:get_app", name="get")
 app.command("inference_endpoint.commands.run.cli:delete_app", name="delete")
 app.command("inference_endpoint.commands.run.cli:pin_app", name="pin")
 app.command("inference_endpoint.commands.run.cli:unpin_app", name="unpin")
+
+# Submission management subcommands — lazy-loaded from commands/submission/cli.py
+app.command("inference_endpoint.commands.submission.cli:create_app", name="create")
+app.command("inference_endpoint.commands.submission.cli:update_app", name="update")
+app.command("inference_endpoint.commands.submission.cli:withdraw_app", name="withdraw")
 
 
 # --- Misc commands ---

@@ -67,6 +67,8 @@ class _RunCreate(BaseModel):
     config: dict[str, Any]
     result_summary: dict[str, Any]
     archive_uri: str
+    model: str | None = None
+    concurrency: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,19 @@ def _extract_timestamps(events: list[dict[str, Any]]) -> tuple[str, str]:
     return started_at, finished_at
 
 
+def _extract_model_concurrency(
+    config: dict[str, Any],
+) -> tuple[str | None, int | None]:
+    """Pull model name and concurrency from a parsed config.yaml dict."""
+    model: str | None = (config.get("model_params") or {}).get("name")
+    lp: dict[str, Any] = (config.get("settings") or {}).get("load_pattern") or {}
+    concurrency: int | None = None
+    if lp.get("type") == "concurrency":
+        raw = lp.get("target_concurrency")
+        concurrency = int(raw) if raw is not None else None
+    return model, concurrency
+
+
 def _store_in_glob(run_root: Path, folder_name: str) -> Path:
     dest = _GLOB_DIR / folder_name
     if dest.exists():
@@ -180,41 +195,72 @@ async def push_run(
     identity: PRISMIdentity = Depends(require_auth),
 ) -> dict[str, Any]:
     """Accept a run archive and forward it to the runs API."""
+    logger.info(
+        "push_run: auth OK — user_id=%s email=%s", identity.user_id, identity.email
+    )
+
     system_info = _SystemInfo(
         email=identity.email,
         company_name=identity.company_name,
         company_external_id=identity.company_external_id,
     )
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        upload_path = tmp_path / "upload.tar.gz"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            upload_path = tmp_path / "upload.tar.gz"
 
-        content = await archive.read()
-        upload_path.write_bytes(content)
-
-        extract_dir = tmp_path / "extracted"
-        extract_dir.mkdir()
-        _extract_archive(upload_path, extract_dir)
-
-        run_root = _find_run_root(extract_dir)
-        missing = _validate_run_files(run_root)
-        if missing:
-            logger.error("Archive missing required files: %s", missing)
-            raise HTTPException(
-                http_status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={"detail": "Missing required files", "missing": missing},
+            content = await archive.read()
+            upload_path.write_bytes(content)
+            logger.info(
+                "push_run: archive received — filename=%s size=%d bytes",
+                archive.filename,
+                len(content),
             )
 
-        config, result_summary, events = _parse_run_files(run_root)
-        started_at, finished_at = _extract_timestamps(events)
+            extract_dir = tmp_path / "extracted"
+            extract_dir.mkdir()
+            _extract_archive(upload_path, extract_dir)
+            logger.info("push_run: archive extracted OK")
 
-        folder_name = (
-            Path(archive.filename).stem.removesuffix(".tar")
-            if archive.filename
-            else "run"
-        )
-        archive_path = _store_in_glob(run_root, folder_name)
+            run_root = _find_run_root(extract_dir)
+            missing = _validate_run_files(run_root)
+            if missing:
+                logger.error("push_run: archive missing required files: %s", missing)
+                raise HTTPException(
+                    http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"detail": "Missing required files", "missing": missing},
+                )
+
+            config, result_summary, events = _parse_run_files(run_root)
+            logger.info(
+                "push_run: run files parsed OK — %d events", len(events)
+            )
+
+            started_at, finished_at = _extract_timestamps(events)
+            logger.info(
+                "push_run: timestamps — started=%s finished=%s", started_at, finished_at
+            )
+
+            folder_name = (
+                Path(archive.filename).stem.removesuffix(".tar")
+                if archive.filename
+                else "run"
+            )
+            archive_path = _store_in_glob(run_root, folder_name)
+            logger.info("push_run: stored in glob at %s", archive_path)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("push_run: unexpected error during archive processing: %s", exc)
+        raise HTTPException(
+            http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error processing archive: {exc}",
+        ) from exc
+
+    model, concurrency = _extract_model_concurrency(config)
+    logger.info("push_run: extracted model=%s concurrency=%s", model, concurrency)
 
     run_create = _RunCreate(
         started_at=started_at,
@@ -225,22 +271,35 @@ async def push_run(
         config=config,
         result_summary=result_summary,
         archive_uri=str(archive_path),
+        model=model,
+        concurrency=concurrency,
+    )
+
+    upstream_url = f"{_RUNS_API_BASE_URL}/runs"
+    logger.info(
+        "push_run: forwarding to upstream %s (user_id=%s)", upstream_url, identity.user_id
     )
 
     async with httpx.AsyncClient() as client:
         try:
             runs_resp = await client.post(
-                f"{_RUNS_API_BASE_URL}/runs",
+                upstream_url,
                 params={"user_id": identity.user_id},
                 json=run_create.model_dump(),
                 timeout=30.0,
             )
         except httpx.RequestError as exc:
-            logger.error("Failed to reach runs API: %s", exc)
+            logger.error("push_run: upstream unreachable — %s", exc)
             raise HTTPException(
                 http_status.HTTP_502_BAD_GATEWAY,
                 detail=f"Failed to create run: runs API unreachable — {exc}",
             ) from exc
+
+    logger.info(
+        "push_run: upstream responded %d — body: %s",
+        runs_resp.status_code,
+        runs_resp.text[:500],
+    )
 
     if runs_resp.status_code == http_status.HTTP_201_CREATED:
         return runs_resp.json()
@@ -250,7 +309,7 @@ async def push_run(
             upstream_errors = runs_resp.json().get("detail", [])
         except Exception:
             upstream_errors = runs_resp.text
-        logger.error("Runs API rejected our payload (422): %s", upstream_errors)
+        logger.error("push_run: upstream rejected payload (422): %s", upstream_errors)
         raise HTTPException(
             http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
@@ -260,9 +319,9 @@ async def push_run(
         )
 
     logger.error(
-        "Runs API returned unexpected %d: %s",
+        "push_run: upstream returned unexpected %d: %s",
         runs_resp.status_code,
-        runs_resp.text[:200],
+        runs_resp.text[:500],
     )
     raise HTTPException(
         http_status.HTTP_502_BAD_GATEWAY,
