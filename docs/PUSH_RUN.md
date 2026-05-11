@@ -342,66 +342,7 @@ Dry run — no upload will be performed.
 
 ---
 
-## 3. Exercising the proxy routes with curl
-
-After pushing at least one run (step 2 above), use the run ID from the push response.
-
-The CLI commands in Terminal 3 above call the same routes. Use curl directly if you want
-to inspect raw HTTP responses or script without the CLI.
-
-```bash
-TOKEN=<your-prism-api-key>
-RUN_ID=<uuid-from-push-response>
-BASE=http://localhost:8082
-
-# List your runs
-curl -s "$BASE/runs?token=$TOKEN" | python3 -m json.tool
-
-# Get a single run
-curl -s "$BASE/runs/$RUN_ID?token=$TOKEN" | python3 -m json.tool
-
-# Pin a run
-curl -s -X PATCH "$BASE/runs/$RUN_ID/pin?token=$TOKEN" | python3 -m json.tool
-
-# Unpin a run
-curl -s -X PATCH "$BASE/runs/$RUN_ID/unpin?token=$TOKEN" | python3 -m json.tool
-
-# Delete a run
-curl -s -X DELETE "$BASE/runs/$RUN_ID?token=$TOKEN"
-```
-
-### Inspect the mock backend directly (no auth needed)
-
-```bash
-# All runs in the mock store
-curl -s http://localhost:8081/runs | python3 -m json.tool
-
-# Filter by owner
-curl -s "http://localhost:8081/runs?user_id=<uuid>" | python3 -m json.tool
-
-# Clear all runs between test attempts
-curl -s -X DELETE http://localhost:8081/runs
-```
-
----
-
-## 4. Raw push with curl (bypassing the CLI)
-
-```bash
-# 1. Create an archive
-tar -czf /tmp/test_run.tar.gz -C ./endpoints_run_samples \
-  llama-3.1-8b_vllm_perf_concurrency1_3a8d044-06ccd43_main_trial1
-
-# 2. POST to the push endpoint
-curl -s -X POST \
-  "http://localhost:8082/push_run?token=<your-api-key>" \
-  -F "archive=@/tmp/test_run.tar.gz;type=application/gzip" \
-  | python3 -m json.tool
-```
-
----
-
-## 5. Environment variable reference
+## 3. Environment variable reference
 
 | Variable            | Component   | Default                 | Description                                                                                                  |
 | ------------------- | ----------- | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -413,7 +354,7 @@ curl -s -X POST \
 
 ---
 
-## 6. Common errors
+## 4. Common errors
 
 | Symptom                                                                          | Cause                                  | Fix                                                                  |
 | -------------------------------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------------------- |
