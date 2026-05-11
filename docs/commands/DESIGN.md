@@ -14,7 +14,8 @@ The command layer is split across:
 - `commands/benchmark/cli.py` for the `benchmark` subcommands (`offline`, `online`, `from-config`)
 - `commands/benchmark/execute.py` for benchmark setup, execution, and finalization
 - `commands/push/cli.py` for `push run` (archive, validate, upload)
-- `commands/run/cli.py` for `list/get/delete/pin/unpin run` (run management via the proxy API)
+- `commands/run/cli.py` for `list/get/delete/pin/unpin run` and `list/get submission` (run and submission read operations via the proxy API)
+- `commands/submission/cli.py` for `create/update/withdraw submission` (submission write operations via the proxy API)
 - One module per simple command: `probe.py`, `info.py`, `validate.py`, `init.py`
 
 Cyclopts constructs typed config objects directly from CLI arguments, so command functions receive
@@ -29,22 +30,27 @@ already-parsed models rather than raw `argparse.Namespace` objects.
 
 ## Command Map
 
-| Subcommand              | Entry point                 | Execution module                 | Status                    |
-| ----------------------- | --------------------------- | -------------------------------- | ------------------------- |
-| `benchmark offline`     | `commands/benchmark/cli.py` | `commands/benchmark/execute.py`  | Implemented               |
-| `benchmark online`      | `commands/benchmark/cli.py` | `commands/benchmark/execute.py`  | Implemented               |
-| `benchmark from-config` | `commands/benchmark/cli.py` | `commands/benchmark/execute.py`  | Implemented               |
-| `push run`              | `commands/push/cli.py`      | inline (httpx upload)            | Implemented               |
-| `list run`              | `commands/run/cli.py`       | inline (httpx GET /runs)         | Implemented               |
-| `get run`               | `commands/run/cli.py`       | inline (httpx GET /runs/{id})    | Implemented               |
-| `delete run`            | `commands/run/cli.py`       | inline (httpx DELETE /runs/{id}) | Implemented               |
-| `pin run`               | `commands/run/cli.py`       | inline (httpx PATCH /runs/{id})  | Implemented               |
-| `unpin run`             | `commands/run/cli.py`       | inline (httpx PATCH /runs/{id})  | Implemented               |
-| `probe`                 | `main.py`                   | `commands/probe.py`              | Implemented               |
-| `info`                  | `main.py`                   | `commands/info.py`               | Implemented               |
-| `validate-yaml`         | `main.py`                   | `commands/validate.py`           | Implemented               |
-| `init`                  | `main.py`                   | `commands/init.py`               | Implemented               |
-| `eval`                  | `main.py`                   | inline stub (`CLIError`)         | Reserved, not implemented |
+| Subcommand                | Entry point                    | Execution module                              | Status                    |
+| ------------------------- | ------------------------------ | --------------------------------------------- | ------------------------- |
+| `benchmark offline`       | `commands/benchmark/cli.py`    | `commands/benchmark/execute.py`               | Implemented               |
+| `benchmark online`        | `commands/benchmark/cli.py`    | `commands/benchmark/execute.py`               | Implemented               |
+| `benchmark from-config`   | `commands/benchmark/cli.py`    | `commands/benchmark/execute.py`               | Implemented               |
+| `push run`                | `commands/push/cli.py`         | inline (httpx upload)                         | Implemented               |
+| `list run`                | `commands/run/cli.py`          | inline (httpx GET /runs)                      | Implemented               |
+| `get run`                 | `commands/run/cli.py`          | inline (httpx GET /runs/{id})                 | Implemented               |
+| `delete run`              | `commands/run/cli.py`          | inline (httpx DELETE /runs/{id})              | Implemented               |
+| `pin run`                 | `commands/run/cli.py`          | inline (httpx PATCH /runs/{id}/pin)           | Implemented               |
+| `unpin run`               | `commands/run/cli.py`          | inline (httpx PATCH /runs/{id}/unpin)         | Implemented               |
+| `list submission`         | `commands/run/cli.py`          | inline (httpx GET /submissions)               | Implemented               |
+| `get submission`          | `commands/run/cli.py`          | inline (httpx GET /submissions/{id})          | Implemented               |
+| `create submission`       | `commands/submission/cli.py`   | inline (httpx POST /submissions)              | Implemented               |
+| `update submission`       | `commands/submission/cli.py`   | inline (httpx PATCH /submissions/{id})        | Implemented               |
+| `withdraw submission`     | `commands/submission/cli.py`   | inline (httpx DELETE /submissions/{id})       | Implemented               |
+| `probe`                   | `main.py`                      | `commands/probe.py`                           | Implemented               |
+| `info`                    | `main.py`                      | `commands/info.py`                            | Implemented               |
+| `validate-yaml`           | `main.py`                      | `commands/validate.py`                        | Implemented               |
+| `init`                    | `main.py`                      | `commands/init.py`                            | Implemented               |
+| `eval`                    | `main.py`                      | inline stub (`CLIError`)                      | Reserved, not implemented |
 
 ## CLI Structure
 
@@ -62,22 +68,33 @@ inference-endpoint
   |     +-- from-config
   |
   +-- push
-  |     +-- run   (--path, --token, --dry-run)
+  |     +-- run         (--path, --token, --dry-run)
   |
   +-- list
-  |     +-- run   (--token)
+  |     +-- run         (--token)
+  |     +-- submission  (--token)
   |
   +-- get
-  |     +-- run   (--token, --run_id)
+  |     +-- run         (--token, --run_id)
+  |     +-- submission  (--token, --submission_id, --include_runs)
   |
   +-- delete
-  |     +-- run   (--token, --run_id)
+  |     +-- run         (--token, --run_id)
   |
   +-- pin
-  |     +-- run   (--token, --run_id)
+  |     +-- run         (--token, --run_id)
   |
   +-- unpin
-  |     +-- run   (--token, --run_id)
+  |     +-- run         (--token, --run_id)
+  |
+  +-- create
+  |     +-- submission  (--token, --benchmark_version, --run_id, ...)
+  |
+  +-- update
+  |     +-- submission  (--token, --submission_id, --status, --pr_url, ...)
+  |
+  +-- withdraw
+  |     +-- submission  (--token, --submission_id)
   |
   +-- probe
   +-- info
@@ -86,9 +103,9 @@ inference-endpoint
   +-- eval
 ```
 
-`benchmark`, `push`, `list`, `get`, `delete`, `pin`, and `unpin` are all registered lazily
-from their respective `cli.py` modules, keeping startup light for simple commands like `info`
-and `validate-yaml`.
+`benchmark`, `push`, `list`, `get`, `delete`, `pin`, `unpin`, `create`, `update`, and `withdraw`
+are all registered lazily from their respective `cli.py` modules, keeping startup light for
+simple commands like `info` and `validate-yaml`.
 
 ## `benchmark` Command Flow
 
@@ -177,4 +194,4 @@ not been implemented yet.
 | `load_generator/session.py` | Runs the benchmark session                                                   |
 | `metrics/`                  | Aggregates and reports benchmark results                                     |
 | `evaluation/`               | Scores collected accuracy datasets during benchmark finalization             |
-| `api/app.py`                | FastAPI proxy server that `push/list/get/delete/pin/unpin run` commands call |
+| `api/app.py`                | FastAPI proxy server that all run and submission management commands call     |

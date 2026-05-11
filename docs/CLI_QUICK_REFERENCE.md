@@ -123,6 +123,63 @@ inference-endpoint push run --path ./my_run_folder
 
 See [docs/PUSH_RUN.md](PUSH_RUN.md) for local dev setup, architecture, and the full test suite.
 
+### Submission Management
+
+Bundle one or more benchmark runs into an MLCommons submission. All commands require
+`--token` (or `ENDPOINTS_TOKEN` env var) and accept `--api-url` (default `http://localhost:8082`).
+
+```bash
+# Create a submission
+inference-endpoint create submission \
+  --benchmark_version a1b2c3d \
+  --run_id <run-uuid-1> \
+  --run_id <run-uuid-2>
+
+# Optional create flags: --availability available (default), --division standardized (default),
+# --early_publish, --publication_cycle <cycle>, --target_availability_date <ISO-date>
+
+# List submissions (pretty table)
+inference-endpoint list submission --token <prism-api-key>
+
+# List submissions (raw JSON)
+inference-endpoint list submission --token <prism-api-key> -j
+
+# Get a single submission (includes embedded run details by default)
+inference-endpoint get submission \
+  --token <prism-api-key> \
+  --submission_id <submission-uuid>
+
+# Get without embedded runs
+inference-endpoint get submission \
+  --token <prism-api-key> \
+  --submission_id <submission-uuid> \
+  --include_runs false
+
+# Update status
+inference-endpoint update submission \
+  --token <prism-api-key> \
+  --submission_id <submission-uuid> \
+  --status PEER_REVIEW_PENDING
+
+# Link a GitHub PR
+inference-endpoint update submission \
+  --token <prism-api-key> \
+  --submission_id <submission-uuid> \
+  --pr_url https://github.com/mlcommons/submissions/pull/42 \
+  --pr_number 42
+
+# Record compliance approval
+inference-endpoint update submission \
+  --token <prism-api-key> \
+  --submission_id <submission-uuid> \
+  --compliance_passed_at 2025-05-01T14:30:00
+
+# Withdraw a submission
+inference-endpoint withdraw submission \
+  --token <prism-api-key> \
+  --submission_id <submission-uuid>
+```
+
 ### Utilities
 
 ```bash
