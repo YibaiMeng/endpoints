@@ -9,10 +9,12 @@
 #     --set LUSTRE_HOME=/lustre/fsw/coreai_mlperf_inference/$USER \
 #     --set SLURM_PARTITION=gb200-backfill \
 #     --set DATASET=coding         # or workflow
+#     -e '--gpus-per-node=1'       # required on clusters that honor it (e.g. gb300)
 #
 # Submit via sbatch:
 #   sflow batch -f examples/09_MultiTurn/qwen36_sflow.yaml --submit \
-#     --set LUSTRE_HOME=... --set SLURM_PARTITION=... --set DATASET=workflow
+#     --set LUSTRE_HOME=... --set SLURM_PARTITION=... --set DATASET=workflow \
+#     -e '--gpus-per-node=1'
 
 version: "0.1"
 
@@ -106,6 +108,9 @@ backends:
     partition: ${{ variables.SLURM_PARTITION }}
     account: ${{ variables.SLURM_ACCOUNT }}
     gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    # gpus_per_node is used only for sflow's internal GPU-packing math. To
+    # actually request the GPU count from Slurm, pass `-e '--gpus-per-node=N'`
+    # on the CLI (some clusters reject this flag — that's why it's opt-in).
 
 operators:
   - name: vllm
@@ -157,6 +162,7 @@ workflow:
           --language-model-only
           --trust-remote-code
           --limit-mm-per-prompt '{"image":0,"video":0}'
+          ${{ variables.EXTRA_VLLM_ARGS }}
       probes:
         readiness:
           http_post:
