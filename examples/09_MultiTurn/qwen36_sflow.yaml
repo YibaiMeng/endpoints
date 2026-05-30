@@ -1,0 +1,240 @@
+# nv-sflow workflow — single-GPU Qwen3.6-35B-A3B-FP8 multi-turn agentic benchmark.
+# https://github.com/NVIDIA/nv-sflow
+#
+# One slurm node, one GPU. Server stays up; client runs once against either the
+# full coding or full workflow split.
+#
+# Run:
+#   sflow run -f examples/09_MultiTurn/qwen36_sflow.yaml \
+#     --set LUSTRE_HOME=/lustre/fsw/coreai_mlperf_inference/$USER \
+#     --set SLURM_PARTITION=gb200-backfill \
+#     --set DATASET=coding         # or workflow
+#
+# Submit via sbatch:
+#   sflow batch -f examples/09_MultiTurn/qwen36_sflow.yaml --submit \
+#     --set LUSTRE_HOME=... --set SLURM_PARTITION=... --set DATASET=workflow
+
+version: "0.1"
+
+variables:
+  # --- Slurm ---
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: coreai_mlperf_inference
+  SLURM_PARTITION:
+    description: "SLURM partition (required — pass --set SLURM_PARTITION=...)"
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit (minutes)"
+    type: integer
+    value: 120
+  SLURM_NODES:
+    description: "Number of nodes"
+    type: integer
+    value: 1
+  GPUS_PER_NODE:
+    description: "GPUs per node"
+    type: integer
+    value: 1
+
+  # --- Container & paths ---
+  VLLM_IMAGE:
+    description: "vLLM container image"
+    value: vllm/vllm-openai:latest
+  LUSTRE_HOME:
+    description: "User's Lustre root, e.g. /lustre/fsw/coreai_mlperf_inference/$USER (required — pass --set LUSTRE_HOME=...)"
+  ENDPOINTS_REPO:
+    description: "Host path to the inference-endpoint checkout (mounted into /opt/endpoints)"
+    value: ${{ variables.LUSTRE_HOME }}/endpoints
+  DATASETS_DIR:
+    description: "Host path to dataset dir (mounted into /workspace/datasets)"
+    value: ${{ variables.LUSTRE_HOME }}/data/examples/09_MultiTurn/datasets
+  RESULTS_DIR:
+    description: "Host path for benchmark output (mounted into /workspace/results)"
+    value: ${{ variables.LUSTRE_HOME }}/logs/qwen36-sflow-results
+  HF_CACHE_DIR:
+    description: "Host path for HuggingFace cache (mounted into /workspace/hf_cache)"
+    value: ${{ variables.LUSTRE_HOME }}/cache/huggingface
+  VLLM_CACHE_DIR:
+    description: "Host path for vLLM cache (torch.compile, shape store; mounted into /workspace/vllm_cache)"
+    value: ${{ variables.LUSTRE_HOME }}/cache/vllm
+
+  # --- Model & dataset ---
+  HF_MODEL_NAME:
+    description: "HF model id"
+    value: Qwen/Qwen3.6-35B-A3B-FP8
+  DATASET:
+    description: "Which agentic split to benchmark (full file)"
+    value: coding
+    domain: [coding, workflow]
+
+  # --- vLLM flags (mirrors qwen36_pareto_sweep.yml) ---
+  MTP:
+    description: "Speculative tokens for qwen3_5_mtp"
+    type: integer
+    value: 1
+  MAX_NUM_BATCHED_TOKENS:
+    description: "vLLM --max-num-batched-tokens"
+    type: integer
+    value: 4096
+  MAX_NUM_SEQS:
+    description: "vLLM --max-num-seqs"
+    type: integer
+    value: 64
+  GPU_MEMORY_UTILIZATION:
+    description: "vLLM --gpu-memory-utilization"
+    value: "0.85"
+  EXTRA_VLLM_ARGS:
+    description: "Extra args appended to `vllm serve`, e.g. `--max-model-len 32768 --enforce-eager`"
+    value: ""
+
+  # --- Client ---
+  CONCURRENCY:
+    description: "multi_turn target_concurrency"
+    type: integer
+    value: 64
+  MAX_NEW_TOKENS:
+    description: "Per-turn max generation length"
+    type: integer
+    value: 20000
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+
+operators:
+  - name: vllm
+    type: srun
+    container_name: vllm_image
+    container_writable: true
+    extra_args:
+      - --container-image=${{ variables.VLLM_IMAGE }}
+      - --container-mounts=${{ variables.ENDPOINTS_REPO }}:/opt/endpoints,${{ variables.DATASETS_DIR }}:/workspace/datasets,${{ variables.RESULTS_DIR }}:/workspace/results,${{ variables.HF_CACHE_DIR }}:/workspace/hf_cache,${{ variables.VLLM_CACHE_DIR }}:/workspace/vllm_cache
+
+workflow:
+  name: qwen36_sflow
+  timeout: 115m
+
+  variables:
+    HEAD_NODE_IP:
+      description: "Head node IP (resolved after allocation)"
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+
+  tasks:
+    - name: vllm_server
+      operator:
+        name: vllm
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_NODE }}
+        nodes:
+          indices: [0]
+      script:
+        - set -x
+        - export VLLM_ENGINE_READY_TIMEOUT_S=1800
+        - export HF_HOME=/workspace/hf_cache
+        - export HF_HUB_CACHE=/workspace/hf_cache/hub
+        - export VLLM_CACHE_ROOT=/workspace/vllm_cache
+        - mkdir -p $HF_HUB_CACHE $VLLM_CACHE_ROOT
+        - >
+          vllm serve ${{ variables.HF_MODEL_NAME }}
+          --tensor-parallel-size 1
+          --gpu-memory-utilization ${{ variables.GPU_MEMORY_UTILIZATION }}
+          --kv-cache-dtype fp8
+          --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":${{ variables.MTP }}}'
+          --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS}
+          --max-num-seqs ${MAX_NUM_SEQS}
+          --enable-auto-tool-choice
+          --tool-call-parser qwen3_coder
+          --reasoning-parser qwen3
+          --language-model-only
+          --trust-remote-code
+          --limit-mm-per-prompt '{"image":0,"video":0}'
+      probes:
+        readiness:
+          http_post:
+            url: "http://${{ variables.HEAD_NODE_IP }}:8000/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.HF_MODEL_NAME }}", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}'
+          timeout: 1800
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: benchmark
+      operator:
+        name: vllm
+        ntasks: 1
+      resources:
+        nodes:
+          indices: [0]
+      depends_on:
+        - vllm_server
+      script:
+        - set -x
+        - export HF_HOME=/workspace/hf_cache
+        - export HF_HUB_CACHE=/workspace/hf_cache/hub
+        - |
+          case "${DATASET}" in
+            coding)   DATASET_FILE=agentic_coding_v3.jsonl   ;;
+            workflow) DATASET_FILE=agentic_workflow_v3.jsonl ;;
+            *) echo "Unknown DATASET=${DATASET}"; exit 2 ;;
+          esac
+          echo "Using dataset file: ${DATASET_FILE}"
+        - if ! command -v inference-endpoint >/dev/null 2>&1; then pip install -q -e /opt/endpoints; fi
+        - mkdir -p ${SFLOW_TASK_OUTPUT_DIR}
+        - |
+          cat > ${SFLOW_TASK_OUTPUT_DIR}/client.yaml <<EOF
+          name: "qwen36-agentic-multiturn-${DATASET}-conc${CONCURRENCY}"
+          version: "1.0"
+          type: "online"
+
+          model_params:
+            name: "${{ variables.HF_MODEL_NAME }}"
+            temperature: 1.0
+            top_p: 0.95
+            max_new_tokens: ${MAX_NEW_TOKENS}
+            chat_template_kwargs:
+              thinking: true
+              preserve_thinking: true
+
+          datasets:
+            - name: agentic_${DATASET}
+              type: performance
+              path: /workspace/datasets/${DATASET_FILE}
+              multi_turn:
+                turn_timeout_s: 600.0
+                enable_salt: true
+                inject_tool_delay: true
+
+          settings:
+            runtime:
+              min_duration_ms: 0
+            load_pattern:
+              type: multi_turn
+              target_concurrency: ${CONCURRENCY}
+            client:
+              warmup_connections: 0
+              max_idle_time: 0.5
+
+          endpoint_config:
+            endpoints:
+              - "http://${{ variables.HEAD_NODE_IP }}:8000"
+            api_type: openai
+
+          report_dir: /workspace/results/${DATASET}-conc${CONCURRENCY}
+          EOF
+        - cat ${SFLOW_TASK_OUTPUT_DIR}/client.yaml
+        - inference-endpoint benchmark from-config --config ${SFLOW_TASK_OUTPUT_DIR}/client.yaml
+        - echo "Benchmark finished"
