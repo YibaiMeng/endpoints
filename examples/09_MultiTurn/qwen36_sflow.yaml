@@ -11,8 +11,10 @@
 #     --set DATASET=coding         # or workflow
 #     -e '--gpus-per-node=1'       # required on clusters that honor it (e.g. gb300)
 #
-# Submit via sbatch:
+# Submit via sbatch. Pass --time explicitly: sflow batch does not read SLURM_TIMELIMIT
+# from the YAML, so without --time the job gets the partition default (often ~30 min).
 #   sflow batch -f examples/09_MultiTurn/qwen36_sflow.yaml --submit \
+#     --time 02:00:00 \
 #     --set LUSTRE_HOME=... --set SLURM_PARTITION=... --set DATASET=workflow \
 #     -e '--gpus-per-node=1'
 
@@ -28,7 +30,7 @@ variables:
   SLURM_TIMELIMIT:
     description: "SLURM time limit (minutes)"
     type: integer
-    value: 120
+    value: 150
   SLURM_NODES:
     description: "Number of nodes"
     type: integer
@@ -111,6 +113,7 @@ backends:
     # gpus_per_node is used only for sflow's internal GPU-packing math. To
     # actually request the GPU count from Slurm, pass `-e '--gpus-per-node=N'`
     # on the CLI (some clusters reject this flag — that's why it's opt-in).
+    # Also need to pass `--time 2h`
 
 operators:
   - name: vllm
