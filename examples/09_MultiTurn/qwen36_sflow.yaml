@@ -165,6 +165,8 @@ workflow:
           --language-model-only
           --trust-remote-code
           --limit-mm-per-prompt '{"image":0,"video":0}'
+          --enable-prompt-tokens-details
+          --enable_prefix_caching
           ${{ variables.EXTRA_VLLM_ARGS }}
       probes:
         readiness:
