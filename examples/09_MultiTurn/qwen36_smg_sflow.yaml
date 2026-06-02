@@ -1,0 +1,434 @@
+# nv-sflow workflow — SMG-routed Qwen3.6-35B-A3B-FP8 multi-turn agentic benchmark
+# with the gateway and client on dedicated CPU nodes.
+# https://github.com/NVIDIA/nv-sflow
+#
+# Serves the model as N data-parallel TP=1 vLLM workers (one per GPU) on a GPU
+# allocation, behind an SMG gateway (https://github.com/lightseekorg/smg) using
+# its cache_aware routing, then runs the multi-turn agentic client (coding/
+# workflow). cache_aware pins each conversation to the
+# worker that cached its growing prefix.
+#
+# TWO slurm allocations:
+#   gpu_cluster (default)  N GPU nodes — the vLLM workers
+#   cpu_cluster            2 CPU nodes — node 0: SMG gateway, node 1: inference benchmark client
+# Note that there's a bug for sflow: https://github.com/NVIDIA/nv-sflow/issues/10
+# To run: 
+# sflow run -f $LHOME/endpoints/examples/09_MultiTurn/qwen36_smg_sflow.yaml 
+# --output-dir $LOGROOT/sflow_output \ 
+# --set LUSTRE_HOME=$LHOME  \   
+# --set SLURM_PARTITION=batch \
+# --set CPU_PARTITION=cpu \
+# --set SLURM_NODES=2 \ 
+# --set CONCURRENCY=1024 \
+# --set DATASET=coding \
+# --set OUTPUT_DIR=$LOGROOT/inference-endpoint
+# Also because of that bug `sflow batch` does not work.
+
+version: "0.1"
+
+variables:
+  # --- Slurm ---
+  SLURM_ACCOUNT:
+    description: "SLURM account"
+    value: coreai_mlperf_inference
+  SLURM_PARTITION:
+    description: "GPU partition for the vLLM workers"
+  CPU_PARTITION:
+    description: "CPU partition for the SMG gateway + `inference-endpoint` client"
+  SLURM_TIMELIMIT:
+    description: "SLURM time limit (minutes), applied to both allocations"
+    type: integer
+    value: 240
+
+  # For 18x4 GB300 NVL72 configuration, each tray is a slurm node. 
+  # So for one GB300 NVL72 domain, keep this <=18 to avoid cross-domain traffic.
+  SLURM_NODES:
+    description: "GPU worker nodes; <=18 for one GB300 NVL72 domain"
+    type: integer
+    value: 1
+  # For TP=1 setup, one vLLM worker per GPU.
+  NTASKS_PER_NODE:
+    description: "vLLM workers per node; each worker is TP=1 on one GPU."
+    type: integer
+    value: 4
+
+  # --- Containers & paths ---
+  VLLM_IMAGE:
+    description: "vLLM image for the workers and client"
+    value: vllm/vllm-openai:nightly
+  SMG_IMAGE:
+    description: "SMG gateway image."
+    value: "ghcr.io#lightseekorg/smg:nightly"
+  LUSTRE_HOME:
+    description: "User's Lustre root, e.g. /lustre/fsw/coreai_mlperf_inference/$USER (required — pass --set LUSTRE_HOME=...)"
+  ENDPOINTS_REPO:
+    description: "Host path to the inference-endpoint checkout w/ multi_turn (mounted into /opt/endpoints)"
+    value: ${{ variables.LUSTRE_HOME }}/endpoints
+  HF_CACHE_DIR:
+    description: "Host HuggingFace cache"
+    value: ${{ variables.LUSTRE_HOME }}/cache/huggingface
+  VLLM_CACHE_DIR:
+    description: "Host vLLM cache (mounted into the workers at /root/.cache/vllm)"
+    value: ${{ variables.LUSTRE_HOME }}/cache/vllm
+  OUTPUT_DIR:
+    description: "Host output dir for the endpoint report (mounted into /output)"
+    value: ${{ variables.LUSTRE_HOME }}/logs/qwen36-smg-multiturn
+  DATASETS_DIR:
+    description: "Host dataset dir (mounted into /workspace/datasets)"
+    value: ${{ variables.LUSTRE_HOME }}/data/examples/09_MultiTurn/datasets
+
+  # --- Model ---
+  MODEL:
+    description: "HF repo id served on each worker"
+    value: Qwen/Qwen3.6-35B-A3B-FP8
+  SERVED_MODEL_NAME:
+    description: "Model name the workers advertise and the client requests"
+    value: ${{ variables.MODEL }}
+
+  # --- Dataset switch (full split) ---
+  DATASET:
+    description: "Which agentic split to benchmark"
+    value: coding
+    domain: [coding, workflow]
+
+  # --- Networking / routing ---
+  WORKER_BASE_PORT:
+    description: "First vLLM worker port; rank r listens on base + r"
+    type: integer
+    value: 8100
+  GATEWAY_PORT:
+    description: "SMG gateway port (SMG default)"
+    type: integer
+    value: 30000
+  ROUTING_POLICY:
+    description: "SMG routing policy; cache_aware keeps a conversation on its cached worker"
+    value: cache_aware
+
+  # --- vLLM worker ---
+  MTP:
+    description: "Speculative tokens for the mtp method (vLLM auto-detects Qwen3.6 MTP heads)"
+    type: integer
+    value: 1
+  MAX_NUM_BATCHED_TOKENS:
+    description: "vLLM --max-num-batched-tokens"
+    type: integer
+    value: 8192
+  MAX_NUM_SEQS:
+    description: "vLLM --max-num-seqs (per vLLM worker, i.e. per GPU)"
+    type: integer
+    value: 128
+  GPU_MEMORY_UTILIZATION:
+    description: "vLLM --gpu-memory-utilization"
+    value: "0.85"
+  EXTRA_VLLM_ARGS:
+    description: "Extra args appended to each `vllm serve`"
+    value: ""
+
+  # --- Client ---
+  # Best set to SLURM_NODES * NTASKS_PER_NODE * MAX_NUM_SEQS
+  CONCURRENCY:
+    description: "multi_turn target_concurrency"
+    type: integer
+    value: 1024
+  MAX_NEW_TOKENS:
+    description: "Per-turn max generation length"
+    type: integer
+    value: 20000
+
+backends:
+  # GPU allocation: the vLLM workers. --segment keeps the N nodes inside one
+  # NVL72 domain
+  - name: gpu_cluster
+    type: slurm
+    default: true
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: ${{ variables.SLURM_NODES }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: ${{ variables.NTASKS_PER_NODE }}
+    extra_args:
+      - --gpus-per-node=${{ variables.NTASKS_PER_NODE }}
+      - --segment=${{ variables.SLURM_NODES }}
+  
+  
+  - name: cpu_cluster
+    type: slurm
+    default: false
+    time: ${{ variables.SLURM_TIMELIMIT }}
+    nodes: 2
+    partition: ${{ variables.CPU_PARTITION }}
+    account: ${{ variables.SLURM_ACCOUNT }}
+    gpus_per_node: 1
+
+operators:
+  - name: vllm
+    type: srun
+    container_name: vllm_image
+    container_writable: true
+    extra_args:
+      - --container-image=${{ variables.VLLM_IMAGE }}
+      - --container-mounts=${{ variables.ENDPOINTS_REPO }}:/opt/endpoints,${{ variables.DATASETS_DIR }}:/workspace/datasets,${{ variables.HF_CACHE_DIR }}:/root/.cache/huggingface,${{ variables.VLLM_CACHE_DIR }}:/root/.cache/vllm
+
+  - name: client
+    type: srun
+    container_name: client_image
+    container_writable: true
+    # Without this the client defaults to using just 1 core.
+    cpus_per_task: 16
+    export: "ALL,NVIDIA_VISIBLE_DEVICES=void"
+    extra_args:
+      - --container-image=${{ variables.VLLM_IMAGE }}
+      - --container-mounts=${{ variables.ENDPOINTS_REPO }}:/opt/endpoints,${{ variables.DATASETS_DIR }}:/workspace/datasets,${{ variables.HF_CACHE_DIR }}:/root/.cache/huggingface,${{ variables.OUTPUT_DIR }}:/output:x-create=dir
+
+  - name: smg
+    type: srun
+    container_name: smg_image
+    container_writable: true
+    # SMG routes ALL concurrent requests through one process; on the srun-default
+    # 1 CPU its tokio routing would bottleneck under load. Give it cores too.
+    cpus_per_task: 16
+    export: "ALL,NVIDIA_VISIBLE_DEVICES=void"
+    extra_args:
+      - --container-image=${{ variables.SMG_IMAGE }}
+      # Non-root SMG image, therefore hf cache location is different.
+      - --container-mounts=${{ variables.HF_CACHE_DIR }}:/workspace/hf_cache
+  
+  # Test to see if smg is actually routing requests.
+  - name: smoke
+    type: srun
+    container_name: smoke_image
+    container_writable: true
+    cpus_per_task: 4
+    export: "ALL,NVIDIA_VISIBLE_DEVICES=void"
+    extra_args:
+      - --container-image=${{ variables.VLLM_IMAGE }}
+
+workflow:
+  name: qwen36_smg_multiturn
+  timeout: 235m
+
+  variables:
+    SMG_NODE_IP:
+      description: "IP of cpu_cluster node 0 (the gateway); the client and probe target this"
+      value: "${{ backends.cpu_cluster.nodes[0].ip_address }}"
+
+  tasks:
+    # ---- N data-parallel TP=1 vLLM workers (one per GPU) on the GPU allocation ----
+    - name: vllm_workers
+      operator:
+        name: vllm
+        ntasks_per_node: ${{ variables.NTASKS_PER_NODE }}
+      resources:
+        nodes:
+          count: ${{ variables.SLURM_NODES }}
+      script:
+        - set -x
+        - |
+          # One GPU per rank. 
+          export CUDA_VISIBLE_DEVICES=${SLURM_LOCALID}
+          export WORKER_PORT=$(( WORKER_BASE_PORT + SLURM_PROCID ))
+          WORKER_IP=$(getent hosts "$(hostname)" | awk '{print $1; exit}')
+          [ -z "${WORKER_IP}" ] && WORKER_IP=$(hostname -I | awk '{print $1}')
+          REG=${SFLOW_WORKFLOW_OUTPUT_DIR}/worker_registry
+          mkdir -p "${REG}"
+          echo "http://${WORKER_IP}:${WORKER_PORT}" > "${REG}/worker_$(printf '%04d' ${SLURM_PROCID}).url"
+          echo "rank=${SLURM_PROCID} local=${SLURM_LOCALID} gpu=${CUDA_VISIBLE_DEVICES} port=${WORKER_PORT} ip=${WORKER_IP}"
+          export HF_HOME=/root/.cache/huggingface
+          export HF_HUB_CACHE=/root/.cache/huggingface/hub
+          export VLLM_CACHE_ROOT=/root/.cache/vllm
+          mkdir -p "${HF_HUB_CACHE}" "${VLLM_CACHE_ROOT}"
+          export VLLM_ENGINE_READY_TIMEOUT_S=1800
+        - >
+          vllm serve ${MODEL}
+          --host 0.0.0.0
+          --port ${WORKER_PORT}
+          --served-model-name ${SERVED_MODEL_NAME}
+          --tensor-parallel-size 1
+          --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION}
+          --kv-cache-dtype fp8
+          --enable-prefix-caching
+          --speculative-config '{"method":"mtp","num_speculative_tokens":${{ variables.MTP }}}'
+          --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS}
+          --max-num-seqs ${MAX_NUM_SEQS}
+          --enable-auto-tool-choice
+          --tool-call-parser qwen3_coder
+          --reasoning-parser qwen3
+          --language-model-only
+          --trust-remote-code
+          --limit-mm-per-prompt '{"image":0,"video":0}'
+          --enable-prompt-tokens-details
+          ${{ variables.EXTRA_VLLM_ARGS }}
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Application startup complete"
+            match_count: ${{ variables.SLURM_NODES * variables.NTASKS_PER_NODE }}
+          timeout: 1800
+          interval: 20
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    # ---- SMG gateway on a dedicated CPU node (cpu_cluster node 0) ----
+    - name: smg_gateway
+      backend: cpu_cluster
+      operator:
+        name: smg
+        ntasks: 1
+      resources:
+        nodes:
+          indices: [0]
+      depends_on:
+        - vllm_workers
+      script:
+        - set -x
+        - |
+          # SMG image is non-root.
+          export HF_HOME=/workspace/hf_cache
+          export HF_HUB_CACHE=/workspace/hf_cache/hub
+          REG=${SFLOW_WORKFLOW_OUTPUT_DIR}/worker_registry
+          EXPECTED=$(( SLURM_NODES * NTASKS_PER_NODE ))
+          # Wait for all vllm workers to be ready.
+          for _ in $(seq 1 60); do
+            COUNT=$(ls "${REG}"/*.url 2>/dev/null | wc -l)
+            [ "${COUNT}" -ge "${EXPECTED}" ] && break
+            echo "waiting for worker registry: ${COUNT}/${EXPECTED}"; sleep 5
+          done
+          WORKER_URLS=$(cat "${REG}"/*.url | tr '\n' ' ')
+          echo "worker_urls=${WORKER_URLS}"
+        - >
+          smg launch
+          --host 0.0.0.0
+          --port ${GATEWAY_PORT}
+          --model-path ${MODEL}
+          --policy ${ROUTING_POLICY}
+          --worker-urls ${WORKER_URLS}
+      probes:
+        readiness:
+          # /health may not be enough: that only checks for the health of the gateway.
+          http_post:
+            url: "http://${{ variables.SMG_NODE_IP }}:${{ variables.GATEWAY_PORT }}/v1/chat/completions"
+            headers:
+              Content-Type: "application/json"
+            body: '{"model": "${{ variables.SERVED_MODEL_NAME }}", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}'
+          timeout: 600
+          interval: 15
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 5
+          interval: 30
+
+    - name: gateway_smoke
+      backend: cpu_cluster
+      operator:
+        name: smoke
+        ntasks: 1
+      resources:
+        nodes:
+          indices: [1]
+      depends_on:
+        - smg_gateway
+      script:
+        - set -x
+        - |
+          python3 - <<'PY'
+          import json, sys, time, urllib.request
+          url = "http://${{ variables.SMG_NODE_IP }}:${{ variables.GATEWAY_PORT }}/v1/chat/completions"
+          body = json.dumps({
+              "model": "${{ variables.SERVED_MODEL_NAME }}",
+              "messages": [{"role": "user", "content": "ping"}],
+              "max_tokens": 1,
+          }).encode()
+          last = None
+          for attempt in range(1, 13):  # ~2 min; covers SMG worker health-check warmup
+              try:
+                  req = urllib.request.Request(
+                      url, data=body, headers={"Content-Type": "application/json"}
+                  )
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      payload = json.load(resp)
+                  if payload.get("choices"):
+                      print(f"GATEWAY SMOKE OK (attempt {attempt}): {url}")
+                      print(json.dumps(payload)[:500])
+                      sys.exit(0)
+                  last = "no choices: " + json.dumps(payload)[:300]
+              except Exception as exc:  # noqa: BLE001
+                  last = repr(exc)
+              print(f"attempt {attempt}: gateway not serving yet ({last}); retry in 10s")
+              time.sleep(10)
+          print(f"GATEWAY SMOKE FAILED after retries: {last}", file=sys.stderr)
+          sys.exit(1)
+          PY
+        - echo "gateway smoke passed"
+
+    # ---- Multi-turn agentic client on a dedicated CPU node (cpu_cluster node 1) ----
+    - name: benchmark
+      backend: cpu_cluster
+      operator:
+        name: client
+        ntasks: 1
+      resources:
+        nodes:
+          indices: [1]
+      depends_on:
+        - gateway_smoke
+      script:
+        - set -x
+        - if ! command -v inference-endpoint >/dev/null 2>&1; then pip install -q -e /opt/endpoints; fi
+        - |
+          case "${DATASET}" in
+            coding)   DATASET_FILE=agentic_coding_v3.jsonl   ;;
+            workflow) DATASET_FILE=agentic_workflow_v3.jsonl ;;
+            *) echo "Unknown DATASET=${DATASET}"; exit 2 ;;
+          esac
+          echo "DATASET=${DATASET} FILE=${DATASET_FILE}"
+          cat > /output/benchmark.yaml <<EOF
+          name: "qwen36-agentic-multiturn-smg-${DATASET}-conc${CONCURRENCY}"
+          version: "1.0"
+          type: "online"
+
+          model_params:
+            name: "${{ variables.SERVED_MODEL_NAME }}"
+            temperature: 1.0
+            top_p: 0.95
+            max_new_tokens: ${MAX_NEW_TOKENS}
+            chat_template_kwargs:
+              thinking: true
+              preserve_thinking: true
+
+          datasets:
+            - name: agentic_${DATASET}
+              type: performance
+              path: /workspace/datasets/${DATASET_FILE}
+              multi_turn:
+                turn_timeout_s: 600.0
+                enable_salt: true
+                inject_tool_delay: true
+
+          settings:
+            runtime:
+              min_duration_ms: 0
+            load_pattern:
+              type: multi_turn
+              target_concurrency: ${CONCURRENCY}
+            client:
+              # by default will use up all cpu cores.
+              num_workers: 8
+              warmup_connections: 0
+              # Default is too short.
+              worker_initialization_timeout: 300.0
+              max_idle_time: 0.5
+
+          endpoint_config:
+            endpoints:
+              - "http://${{ variables.SMG_NODE_IP }}:${{ variables.GATEWAY_PORT }}"
+            api_type: openai
+
+          report_dir: /output/${DATASET}-conc${CONCURRENCY}
+          EOF
+          cat /output/benchmark.yaml
+        - inference-endpoint benchmark from-config --config /output/benchmark.yaml
+        - echo "SMG multi-turn benchmark finished"
