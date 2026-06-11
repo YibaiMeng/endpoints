@@ -61,7 +61,7 @@ variables:
   # --- Containers & paths ---
   VLLM_IMAGE:
     description: "vLLM image for the workers and client"
-    value: vllm/vllm-openai:nightly
+    value: vllm/vllm-openai:latest
   SMG_IMAGE:
     description: "SMG gateway image."
     value: "ghcr.io#lightseekorg/smg:nightly"
