@@ -167,7 +167,9 @@ backends:
     nodes: 2
     partition: ${{ variables.CPU_PARTITION }}
     account: ${{ variables.SLURM_ACCOUNT }}
-    gpus_per_node: 1
+    gpus_per_node: 1 # I think this must be here despite not meaning anything.
+    extra_args:
+      - "--exclusive"
 
 operators:
   - name: vllm
@@ -183,7 +185,7 @@ operators:
     container_name: client_image
     container_writable: true
     # Without this the client defaults to using just 1 core.
-    cpus_per_task: 16
+    cpus_per_task: 64
     export: "ALL,NVIDIA_VISIBLE_DEVICES=void"
     extra_args:
       - --container-image=${{ variables.VLLM_IMAGE }}
@@ -195,7 +197,7 @@ operators:
     container_writable: true
     # SMG routes ALL concurrent requests through one process; on the srun-default
     # 1 CPU its tokio routing would bottleneck under load. Give it cores too.
-    cpus_per_task: 16
+    cpus_per_task: 64
     export: "ALL,NVIDIA_VISIBLE_DEVICES=void"
     extra_args:
       - --container-image=${{ variables.SMG_IMAGE }}
@@ -467,7 +469,7 @@ workflow:
               target_concurrency: ${CONCURRENCY}
             client:
               # by default will use up all cpu cores.
-              num_workers: 8
+              num_workers: 64
               warmup_connections: 0
               # Default is too short.
               worker_initialization_timeout: 300.0
