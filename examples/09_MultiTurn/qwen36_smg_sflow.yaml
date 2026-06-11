@@ -22,6 +22,12 @@
 # --set CONCURRENCY=1024 \
 # --set DATASET=coding \
 # --set OUTPUT_DIR=$LOGROOT/inference-endpoint
+#
+# To benchmark local vLLM source changes (e.g. a PR under review), point
+# VLLM_REPO at a host vLLM checkout. Each worker reinstalls it editable on top
+# of the image's precompiled wheel before serving (pure-Python edits only, no
+# C++ recompile):
+#   --set VLLM_REPO=/path/to/your/vllm
 # Also because of that bug `sflow batch` does not work.
 
 version: "0.1"
@@ -123,6 +129,9 @@ variables:
   EXTRA_VLLM_ARGS:
     description: "Extra args appended to each `vllm serve`"
     value: ""
+  VLLM_REPO:
+    description: "Host path to a vLLM source checkout. Empty = use the image's vLLM. When set, it's mounted at /opt/vllm and each worker reinstalls vLLM editable from it on the image's precompiled wheel (VLLM_USE_PRECOMPILED=1 — pure-Python edits apply, no C++ recompile). Writes .so + egg-info into the checkout, like a local `pip install -e .`."
+    value: ""
 
   # --- Client ---
   # Best set to SLURM_NODES * NTASKS_PER_NODE * MAX_NUM_SEQS
@@ -167,7 +176,7 @@ operators:
     container_writable: true
     extra_args:
       - --container-image=${{ variables.VLLM_IMAGE }}
-      - --container-mounts=${{ variables.ENDPOINTS_REPO }}:/opt/endpoints,${{ variables.DATASETS_DIR }}:/workspace/datasets,${{ variables.HF_CACHE_DIR }}:/root/.cache/huggingface,${{ variables.VLLM_CACHE_DIR }}:/root/.cache/vllm
+      - --container-mounts=${{ variables.ENDPOINTS_REPO }}:/opt/endpoints,${{ variables.DATASETS_DIR }}:/workspace/datasets,${{ variables.HF_CACHE_DIR }}:/root/.cache/huggingface,${{ variables.VLLM_CACHE_DIR }}:/root/.cache/vllm${{ (',' + variables.VLLM_REPO + ':/opt/vllm') if variables.VLLM_REPO else '' }}
 
   - name: client
     type: srun
@@ -238,6 +247,47 @@ workflow:
           export VLLM_CACHE_ROOT=/root/.cache/vllm
           mkdir -p "${HF_HUB_CACHE}" "${VLLM_CACHE_ROOT}"
           export VLLM_ENGINE_READY_TIMEOUT_S=1800
+        - |
+          # Optional vLLM rebuild from the mounted source checkout (set VLLM_REPO).
+          # Global rank 0 reinstalls vLLM editable on top of the image's precompiled
+          # wheel (VLLM_USE_PRECOMPILED=1 — pure-Python edits apply, no C++ recompile),
+          # extracting the .so into the Lustre-shared /opt/vllm tree exactly once.
+          # /opt/vllm is the same Lustre path on every node, so a single writer avoids
+          # a cross-node race. Every rank then puts /opt/vllm first on PYTHONPATH, so
+          # all workers on all nodes import the rebuilt source; non-zero ranks wait on
+          # a per-run marker until rank 0 is done.
+          if [ -n "${VLLM_REPO:-}" ]; then
+            MARK="${SFLOW_WORKFLOW_OUTPUT_DIR}/.vllm_build_done"
+            if [ "${SLURM_PROCID:-0}" = "0" ]; then
+              # &&-chained (not set -e): set -e is suppressed inside a subshell
+              # used as the left operand of ||, so chaining is what aborts on the
+              # first failure.
+              if ! (
+                { command -v git >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq --no-install-recommends git; }; } &&
+                git config --global --add safe.directory '*' &&
+                cd /opt/vllm &&
+                pip install --no-deps -r requirements/build/cuda.txt &&
+                # SETUPTOOLS_SCM_PRETEND_VERSION: the checkout's .git is a worktree
+                # pointer to a bare repo at a host path that doesn't exist inside
+                # the container, so setuptools-scm can't read git history to derive
+                # the version. Pretend-version bypasses that; the value is only used
+                # for the installed package's .dist-info metadata, not for runtime.
+                PRETEND_VER=$(python3 -c "import importlib.metadata; print(importlib.metadata.version('vllm'))" 2>/dev/null || echo "0.1.0.dev0")
+                SETUPTOOLS_SCM_PRETEND_VERSION="${PRETEND_VER}" VLLM_USE_PRECOMPILED=1 pip install --no-build-isolation -e .
+              ); then
+                echo "FATAL: vLLM rebuild from /opt/vllm failed" >&2
+                exit 1
+              fi
+              touch "${MARK}"
+            else
+              echo "rank ${SLURM_PROCID:-?}: waiting for global vLLM rebuild (rank 0)"
+              for _ in $(seq 1 360); do [ -f "${MARK}" ] && break; sleep 5; done
+              [ -f "${MARK}" ] || { echo "FATAL: vLLM build marker never appeared" >&2; exit 1; }
+            fi
+            export PYTHONPATH="/opt/vllm${PYTHONPATH:+:$PYTHONPATH}"
+            python3 -c "import vllm; print('rank ${SLURM_PROCID:-0} vllm', vllm.__version__, vllm.__file__)" \
+              || { echo "FATAL: rebuilt vllm failed to import" >&2; exit 1; }
+          fi
         - >
           vllm serve ${MODEL}
           --host 0.0.0.0
