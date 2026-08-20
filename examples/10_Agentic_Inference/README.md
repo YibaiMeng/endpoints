@@ -187,13 +187,13 @@ Official submissions must enable both inline accuracy and SWE-bench accuracy. Co
 
 Qwen3.6-35B-A3B submissions must set `accuracy_config.extras.swebench_template: qwen_tools`. Kimi K2.6 submissions must omit `accuracy_config.extras.swebench_template`.
 
-Every submitted Pareto point must satisfy all of the following accuracy thresholds:
+Every submitted Pareto point must satisfy all of the following accuracy thresholds, except that SWE-bench accuracy is evaluated using mean-of-N for both models. For each model, average one SWE-bench accuracy result from each of the [four mandatory regions](https://github.com/mlcommons/endpoints_policies/blob/main/endpoints_rules.md#54-regions-of-interest) (`N = 4`), then compare that mean with the model-specific SWE-bench threshold below.
 
 | Metric             |        Kimi K2.6 |  Qwen3.6-35B-A3B |
 | ------------------ | ---------------: | ---------------: |
 | Inline accuracy    |      `>= 63.08%` |      `>= 55.86%` |
 | OSL per-turn mean  | `404-494` tokens | `355-434` tokens |
-| SWE-bench accuracy |       `>= 76.5%` |       `>= 67.5%` |
+| SWE-bench accuracy |       `>= 76.5%` |         `>= 69%` |
 
 ### Speculative Decoding
 
