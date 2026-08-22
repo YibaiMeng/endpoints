@@ -734,6 +734,12 @@ def test_pyxis_normalizes_instance_id_for_registry_image():
     )
 
 
+def test_pyxis_resolves_file_image_from_instance_id():
+    assert resolve_image("file:///shared/swebench-images", "Repo__Repo-1") == (
+        "/shared/swebench-images/sweb.eval.arm64.repo__repo-1.sqsh"
+    )
+
+
 def test_pyxis_image_registry_requires_repository():
     with pytest.raises(RunnerError, match="must include a repository"):
         resolve_image("registry.example.com", "repo__repo-1")

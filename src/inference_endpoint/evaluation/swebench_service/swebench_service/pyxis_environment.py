@@ -233,6 +233,11 @@ def _srun_evidence(output: str | bytes | None, limit: int = 2000) -> str:
 def resolve_image(image_registry: str, instance_id: str) -> str:
     if Path(instance_id).name != instance_id or instance_id in {".", ".."}:
         raise RunnerError(f"invalid SWE-bench instance ID: {instance_id}")
+    if image_registry.startswith("file://"):
+        return (
+            f"{image_registry.removeprefix('file://').rstrip('/')}"
+            f"/sweb.eval.arm64.{instance_id.lower()}.sqsh"
+        )
     image_registry = image_registry.rstrip("/")
     if "#" not in image_registry:
         host, separator, repository = image_registry.partition("/")
