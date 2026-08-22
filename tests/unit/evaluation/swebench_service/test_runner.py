@@ -972,6 +972,54 @@ def test_pyxis_environment_extracts_submission(monkeypatch, tmp_path):
     environment.cleanup()
 
 
+def test_pyxis_environment_extracts_submission_after_srun_requeue_preamble(
+    monkeypatch, tmp_path
+):
+    class Submitted(Exception):
+        pass
+
+    minisweagent = types.ModuleType("minisweagent")
+    exceptions = types.ModuleType("minisweagent.exceptions")
+    exceptions.Submitted = Submitted
+    monkeypatch.setitem(sys.modules, "minisweagent", minisweagent)
+    monkeypatch.setitem(sys.modules, "minisweagent.exceptions", exceptions)
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        output = (
+            "ok\n"
+            if calls == 1
+            else "srun: lua: Checking requeue policy with options:\nordinary output\n"
+            if calls == 2
+            else (
+                "srun: lua: Checking requeue policy with options:\n"
+                "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n"
+                "diff --git a/a b/a\n"
+            )
+        )
+        _finish_srun_step(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    environment = PyxisEnvironment(image=tmp_path / "task.sqsh", run_id="run-1")
+
+    output = environment.execute({"command": "normal"})
+
+    assert output["output"] == (
+        "srun: lua: Checking requeue policy with options:\nordinary output\n"
+    )
+
+    with pytest.raises(Submitted) as exc_info:
+        environment.execute({"command": "submit"})
+
+    assert exc_info.value.args[0]["extra"]["submission"] == "diff --git a/a b/a\n"
+    environment.cleanup()
+
+
 def test_pyxis_environment_decodes_timeout_output(monkeypatch, tmp_path):
     monkeypatch.setenv("SLURM_JOB_ID", "1738605")
     monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")

@@ -344,15 +344,24 @@ class PyxisEnvironment:
                 "exception_info": "",
             }
         lines = output.get("output", "").lstrip().splitlines(keepends=True)
+        sentinel_index = (
+            1
+            if (
+                lines
+                and lines[0].strip()
+                == "srun: lua: Checking requeue policy with options:"
+            )
+            else 0
+        )
         if (
-            lines
-            and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+            len(lines) > sentinel_index
+            and lines[sentinel_index].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
             and output["returncode"] == 0
         ):
             # mini-swe-agent is installed only in the SWE-bench service subproject.
             from minisweagent.exceptions import Submitted
 
-            submission = "".join(lines[1:])
+            submission = "".join(lines[sentinel_index + 1 :])
             raise Submitted(
                 {
                     "role": "exit",
