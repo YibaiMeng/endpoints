@@ -19,6 +19,9 @@ from inference_endpoint.evaluation.swebench_service.swebench_service.schemas imp
     RunRequest,
     RunStatus,
 )
+from inference_endpoint.evaluation.swebench_service.swebench_service.runner import (
+    RunCancelled,
+)
 from inference_endpoint.evaluation.swebench_service.swebench_service.server import (
     MANAGER_KEY,
     RunManager,
@@ -45,6 +48,19 @@ class FakeRunner:
             '{"resolved_instances":1,"submitted_instances":1}'
         )
         return {"resolved_instances": 1, "submitted_instances": 1}
+
+
+class PyxisFailureRunner:
+    def __init__(self, *, marker: bool, error: str):
+        self.marker = marker
+        self.error = error
+
+    def run(self, request, run_dir: Path, cancel_token=None):
+        if self.marker:
+            output_dir = run_dir / "swe_bench_output"
+            output_dir.mkdir()
+            (output_dir / ".pyxis_infrastructure_failure").touch()
+        raise RuntimeError(self.error)
 
 
 class AgentProgressRunner:
@@ -124,6 +140,25 @@ class CancellationAwareRunner:
                 self.cancelled.set()
             return {"resolved_instances": 0, "submitted_instances": 0}
         finally:
+            self.cleaned.set()
+
+
+class BlockingCleanupRunner:
+    def __init__(self):
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+        self.cleanup_release = threading.Event()
+        self.cleaned = threading.Event()
+
+    def run(self, request, run_dir: Path, cancel_token=None):
+        try:
+            self.started.set()
+            while cancel_token is not None and not cancel_token.is_cancelled():
+                time.sleep(0.01)
+            self.cancelled.set()
+            raise RunCancelled("cancelled for test")
+        finally:
+            assert self.cleanup_release.wait(2)
             self.cleaned.set()
 
 
@@ -411,6 +446,63 @@ async def test_runner_transitions_to_failed(tmp_path):
 
     assert status["status"] == "failed"
     assert "runner failed" in status["error"]
+    assert status["infrastructure_failure"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("marker", "error"),
+    [
+        (True, "Pyxis infrastructure failure during agent execution"),
+        (True, "Pyxis infrastructure failure evaluating: repo__repo-1"),
+        (False, "failed to clean up Pyxis containers for SWE-bench run run-id"),
+    ],
+)
+async def test_runner_reports_pyxis_infrastructure_failure(marker, error, tmp_path):
+    client = await _client(tmp_path, PyxisFailureRunner(marker=marker, error=error))
+    try:
+        submit = await client.post("/v1/runs", json=_payload())
+        submitted = await submit.json()
+        for _ in range(20):
+            status_resp = await client.get(f"/v1/runs/{submitted['run_id']}")
+            status = await status_resp.json()
+            if status["status"] == "failed":
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await client.close()
+
+    assert status["status"] == "failed"
+    assert status["infrastructure_failure"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("marker", "error"),
+    [
+        (True, "runner failed"),
+        (False, "Pyxis infrastructure failure during agent execution"),
+        (False, "SWE-bench evaluation failed for: repo__repo-1"),
+    ],
+)
+async def test_runner_does_not_infer_pyxis_failure_from_stale_marker_or_text(
+    marker, error, tmp_path
+):
+    client = await _client(tmp_path, PyxisFailureRunner(marker=marker, error=error))
+    try:
+        submit = await client.post("/v1/runs", json=_payload())
+        submitted = await submit.json()
+        for _ in range(20):
+            status_resp = await client.get(f"/v1/runs/{submitted['run_id']}")
+            status = await status_resp.json()
+            if status["status"] == "failed":
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await client.close()
+
+    assert status["status"] == "failed"
+    assert status["infrastructure_failure"] is False
 
 
 @pytest.mark.asyncio
@@ -423,14 +515,22 @@ async def test_cancel_run_marks_cancelled_and_signals_runner(tmp_path):
         assert await asyncio.to_thread(runner.started.wait, 2)
 
         cancel_resp = await client.post(f"/v1/runs/{submitted['run_id']}/cancel")
-        cancelled = await cancel_resp.json()
+        cancel_status = await cancel_resp.json()
 
         assert await asyncio.to_thread(runner.cancelled.wait, 2)
+        for _ in range(20):
+            status_resp = await client.get(f"/v1/runs/{submitted['run_id']}")
+            cancelled = await status_resp.json()
+            if cancelled["status"] == "cancelled":
+                break
+            await asyncio.sleep(0.01)
     finally:
         await client.close()
 
     assert cancel_resp.status == 200
+    assert cancel_status["status"] in {"running", "cancelled"}
     assert cancelled["status"] == "cancelled"
+    assert cancelled["infrastructure_failure"] is False
 
 
 @pytest.mark.asyncio
@@ -463,11 +563,41 @@ async def test_cancellation_keeps_event_loop_responsive(monkeypatch, tmp_path):
         assert not cancel_task.done()
     finally:
         cancel_release.set()
-    cancelled = await cancel_task
+    await cancel_task
     await manager.shutdown()
 
-    assert cancelled.status == "cancelled"
+    assert (await manager.get(submitted.run_id)).status == "cancelled"
     assert runner.cleaned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_keeps_capacity_reserved_until_runner_cleanup_finishes(tmp_path):
+    runner = BlockingCleanupRunner()
+    manager = RunManager(
+        config=ServiceConfig(artifact_root=tmp_path, max_concurrent_runs=1),
+        runner=runner,
+    )
+    request = RunRequest.model_validate(_payload())
+    submitted = await manager.submit(request)
+    task = manager._tasks[submitted.run_id]
+    assert await asyncio.to_thread(runner.started.wait, 2)
+
+    cancel_status = await manager.cancel(submitted.run_id)
+    assert await asyncio.to_thread(runner.cancelled.wait, 2)
+    assert cancel_status.status == "running"
+    assert manager.active_count() == 1
+    with pytest.raises(web.HTTPTooManyRequests):
+        await manager.submit(request)
+
+    runner.cleanup_release.set()
+    await task
+    assert runner.cleaned.is_set()
+    assert (await manager.get(submitted.run_id)).status == "cancelled"
+    assert manager.active_count() == 0
+
+    accepted = await manager.submit(request)
+    assert accepted.status == "queued"
+    await manager.shutdown()
 
 
 @pytest.mark.asyncio

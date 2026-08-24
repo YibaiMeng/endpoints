@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from inference_endpoint.config.schema import ScorerMethod
@@ -70,6 +72,8 @@ class TestOptions:
         )
         assert options["shard_size"] == 10
         assert options["max_attempts"] == 3
+        assert options["max_consecutive_env_faults"] == 3
+        assert options["env_fault_backoff_s"] == 60
         # The tool-call gate's floor must stay at SWE-bench prompt scale.
         assert options["min_prompt_tokens"] == 2000
 
@@ -78,6 +82,86 @@ class TestOptions:
             SWEBenchFleetScorer._resolve_options(
                 {"swebench_service_urls": URLS, "shard_size": 0}
             )
+
+    def test_max_consecutive_env_faults_must_be_positive(self):
+        with pytest.raises(SetupError, match="max_consecutive_env_faults"):
+            SWEBenchFleetScorer._resolve_options(
+                {"swebench_service_urls": URLS, "max_consecutive_env_faults": 0}
+            )
+
+    def test_env_fault_backoff_s_must_be_nonnegative(self):
+        with pytest.raises(SetupError, match="env_fault_backoff_s"):
+            SWEBenchFleetScorer._resolve_options(
+                {"swebench_service_urls": URLS, "env_fault_backoff_s": -1}
+            )
+
+
+class TestDispatcherConfiguration:
+    def test_environment_fault_options_are_forwarded(self, monkeypatch, tmp_path):
+        captured: dict[str, object] = {}
+
+        class FakeDispatcher:
+            quarantined: dict[str, str] = {}
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run(self):
+                pass
+
+        scorer = object.__new__(SWEBenchFleetScorer)
+        scorer.report_dir = tmp_path
+        scorer.options = SWEBenchFleetScorer._resolve_options(
+            {
+                "swebench_service_urls": URLS,
+                "max_consecutive_env_faults": 5,
+                "env_fault_backoff_s": 17,
+            }
+        )
+
+        monkeypatch.setattr(
+            fleet_scorer_mod,
+            "load_benchmark_config",
+            lambda _: {
+                "model_params": {"name": "test-model"},
+                "endpoint_config": {"endpoints": ["http://endpoint"]},
+            },
+        )
+        monkeypatch.setattr(
+            SWEBenchFleetScorer, "_instance_ids", lambda _: ["instance-1"]
+        )
+        monkeypatch.setattr(
+            fleet_scorer_mod,
+            "build_gates",
+            lambda **_: ([], SimpleNamespace(fingerprint=lambda _: "fingerprint")),
+        )
+        monkeypatch.setattr(fleet_scorer_mod, "run_gates", lambda *_: None)
+        monkeypatch.setattr(
+            SWEBenchScorer, "_generation_params", staticmethod(lambda _: {})
+        )
+        monkeypatch.setattr(
+            fleet_scorer_mod,
+            "plan_units",
+            lambda *_args, **_kwargs: SimpleNamespace(run_id="test-run", digest="digest"),
+        )
+        monkeypatch.setattr(fleet_scorer_mod, "WorkQueue", lambda *_: object())
+        monkeypatch.setattr(fleet_scorer_mod, "FleetDispatcher", FakeDispatcher)
+        monkeypatch.setattr(
+            fleet_scorer_mod,
+            "merge_run",
+            lambda *_: SimpleNamespace(
+                resolved_instances=1,
+                total_instances=1,
+                resolved_rate=1.0,
+                unit_count=1,
+                to_dict=lambda: {},
+            ),
+        )
+        monkeypatch.setattr(fleet_scorer_mod, "write_merge_artifacts", lambda *_: None)
+
+        assert scorer.score() == (1.0, 1)
+        assert captured["max_consecutive_env_faults"] == 5
+        assert captured["env_fault_backoff_s"] == 17
 
 
 class TestPollUnit:

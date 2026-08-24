@@ -95,6 +95,7 @@ class FleetDispatcher:
         max_attempts: int = 3,
         stall_timeout_s: float = 3 * 60 * 60,
         max_consecutive_env_faults: int = 3,
+        env_fault_backoff_s: int = 60,
         idle_poll_s: float = 1.0,
         unit_root: Path | None = None,
         killed_dir: Path | None = None,
@@ -110,6 +111,7 @@ class FleetDispatcher:
         self.max_attempts = max_attempts
         self.stall_timeout_s = stall_timeout_s
         self.max_consecutive_env_faults = max_consecutive_env_faults
+        self.env_fault_backoff_s = env_fault_backoff_s
         self.idle_poll_s = idle_poll_s
         self.unit_root = unit_root
         self.killed_dir = killed_dir
@@ -149,6 +151,15 @@ class FleetDispatcher:
                 with self._lock:
                     self._in_flight -= 1
             self._check_stall(state)
+            if (
+                outcome.result.outcome is UnitOutcome.ENV_FAULT
+                and self.env_fault_backoff_s
+                and state.available
+            ):
+                # _settle() has returned this unit to the queue. Hold this
+                # service back so a transient host fault does not immediately
+                # turn into another request to the same host.
+                time.sleep(self.env_fault_backoff_s)
 
     def _take_unit(self, fingerprint: str | None) -> Unit | None:
         """Claim the next available unit and mark it in flight, atomically.
@@ -211,6 +222,13 @@ class FleetDispatcher:
 
         base.duration_s = time.monotonic() - started
         if status.get("status") != "succeeded":
+            if status.get("infrastructure_failure") is True:
+                base.outcome = UnitOutcome.ENV_FAULT
+                base.detail = (
+                    "service run ended with a Pyxis infrastructure failure: "
+                    f"{status.get('error')}"
+                )
+                return DispatchOutcome(result=base, terminal=False)
             base.outcome = UnitOutcome.FAILED
             base.detail = (
                 f"service run ended {status.get('status')}: {status.get('error')}"

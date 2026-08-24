@@ -46,6 +46,7 @@ _PROGRESS_REFRESH_INTERVAL_S = 1.0
 _ARTIFACT_RETENTION_GRACE_S = 5 * 60
 _PRUNE_RETRY_INTERVAL_S = 1.0
 _LOG_ARTIFACT_NAMES = frozenset({"swe_bench_agent.log", "swe_bench_eval.log"})
+_PYXIS_INFRASTRUCTURE_FAILURE_MARKER = ".pyxis_infrastructure_failure"
 logger = logging.getLogger(__name__)
 
 
@@ -174,6 +175,9 @@ class RunManager:
                         run_id,
                         status="failed",
                         phase="failed",
+                        infrastructure_failure=self._is_pyxis_infrastructure_failure(
+                            run_dir, exc
+                        ),
                         error=redact_text(
                             str(exc), self._secret_values.get(run_id, set())
                         ),
@@ -223,6 +227,22 @@ class RunManager:
             self._tasks.pop(run_id, None)
             self._schedule_prune()
 
+    @staticmethod
+    def _is_pyxis_infrastructure_failure(run_dir: Path, exc: Exception) -> bool:
+        marker_exists = (
+            run_dir
+            / "swe_bench_output"
+            / _PYXIS_INFRASTRUCTURE_FAILURE_MARKER
+        ).exists()
+        message = str(exc).casefold()
+        return (
+            marker_exists
+            and (
+                "pyxis infrastructure failure during agent execution" in message
+                or "pyxis infrastructure failure evaluating" in message
+            )
+        ) or "failed to clean up pyxis containers for swe-bench run" in message
+
     async def cancel(self, run_id: str) -> RunStatus:
         status = await self.get(run_id)
         if status.status not in {"queued", "running"}:
@@ -230,11 +250,9 @@ class RunManager:
         token = self._cancel_tokens.get(run_id)
         if token is not None:
             await asyncio.to_thread(token.cancel)
-        try:
-            progress = await self._terminal_progress_async(run_id, "cancelled")
-        except OSError:
-            progress = {"phase": "cancelled", "message": "cancelled"}
-        await self._transition(run_id, status="cancelled", **progress)
+        # Keep the run active until _execute() returns from runner cleanup and
+        # publishes the terminal cancellation. Otherwise admission can start a
+        # replacement while the old Pyxis steps are still tearing down.
         return self.runs[run_id]
 
     async def cancel_all_active(self) -> None:

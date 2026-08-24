@@ -19,6 +19,8 @@ Configured entirely through ``accuracy_config.extras``::
           - http://swe-host-2:18080
         shard_size: 10
         max_attempts: 3
+        max_consecutive_env_faults: 3
+        env_fault_backoff_s: 60
         expected_model: Org/Model-FP8      # optional; gates the checkpoint
         min_prompt_tokens: 2000
 """
@@ -62,6 +64,8 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
     SKIP_ENDPOINT_PHASE: ClassVar[bool] = True
     DEFAULT_SHARD_SIZE: ClassVar[int] = 10
     DEFAULT_MAX_ATTEMPTS: ClassVar[int] = 3
+    DEFAULT_MAX_CONSECUTIVE_ENV_FAULTS: ClassVar[int] = 3
+    DEFAULT_ENV_FAULT_BACKOFF_S: ClassVar[int] = 60
     DEFAULT_MIN_PROMPT_TOKENS: ClassVar[int] = 2000
     DEFAULT_STALL_TIMEOUT_S: ClassVar[int] = 3 * 60 * 60
     DEFAULT_SERVICE_TIMEOUT_S: ClassVar[int] = 24 * 60 * 60
@@ -136,6 +140,18 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
         )
         options["max_attempts"] = SWEBenchScorer._get_extra_int(
             extras, "max_attempts", default=cls.DEFAULT_MAX_ATTEMPTS, min_value=1
+        )
+        options["max_consecutive_env_faults"] = SWEBenchScorer._get_extra_int(
+            extras,
+            "max_consecutive_env_faults",
+            default=cls.DEFAULT_MAX_CONSECUTIVE_ENV_FAULTS,
+            min_value=1,
+        )
+        options["env_fault_backoff_s"] = SWEBenchScorer._get_extra_int(
+            extras,
+            "env_fault_backoff_s",
+            default=cls.DEFAULT_ENV_FAULT_BACKOFF_S,
+            min_value=0,
         )
         options["min_prompt_tokens"] = SWEBenchScorer._get_extra_int(
             extras,
@@ -281,6 +297,8 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
             fingerprint=fingerprint,
             max_attempts=self.options["max_attempts"],
             stall_timeout_s=self.options["stall_timeout_s"],
+            max_consecutive_env_faults=self.options["max_consecutive_env_faults"],
+            env_fault_backoff_s=self.options["env_fault_backoff_s"],
             unit_root=unit_root,
         )
         dispatcher.run()

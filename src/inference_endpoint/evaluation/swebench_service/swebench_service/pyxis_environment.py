@@ -51,6 +51,11 @@ _SAFE_SRUN_ENV = (
     "SLURM_CONF",
 )
 _STEP_STATUS = "/tmp/.mlperf_srun_status"
+# Pyxis/Enroot can spend substantial time admitting a nested srun step or
+# tearing it down when the cluster is under contention. This is intentionally
+# separate from the command deadline passed to GNU timeout in _STEP_SCRIPT.
+SRUN_TEARDOWN_GRACE_S = 300
+PYXIS_CLEANUP_TIMEOUT_S = 300
 _STEP_SCRIPT = r"""set +e
 status_path=$1
 timeout_s=$2
@@ -128,56 +133,64 @@ def run_srun_step(
     workdir: str | None = None,
     stderr: int = subprocess.STDOUT,
 ) -> subprocess.CompletedProcess[str]:
-    status_path.write_text("pending\n")
-    status_path.chmod(0o666)
-    command = build_srun_command(
-        image=image,
-        name=name,
-        mounts=mounts,
-        workdir=workdir,
-        argv=[
-            "bash",
-            "-c",
-            _STEP_SCRIPT,
-            "pyxis-step",
-            _STEP_STATUS,
-            str(timeout_s),
-            *argv,
-        ],
-    )
-    try:
-        result = subprocess.run(
-            command,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            timeout=timeout_s + 30,
-            env=safe_srun_env(),
+    # The workload must not share a predictable status file with the host. A
+    # test that removes or rewrites that file would otherwise look exactly like
+    # an srun/Pyxis failure. Mount a fresh host-only file at a per-step path.
+    with tempfile.TemporaryDirectory(prefix="mlperf_srun_status_") as status_tmp:
+        host_status_path = Path(status_tmp) / status_path.name
+        host_status_path.write_text("pending\n")
+        host_status_path.chmod(0o666)
+        container_status_path = f"/tmp/{status_path.name}.{uuid.uuid4().hex}"
+        step_mounts = [*(mounts or []), (host_status_path, container_status_path)]
+        command = build_srun_command(
+            image=image,
+            name=name,
+            mounts=step_mounts,
+            workdir=workdir,
+            argv=[
+                "bash",
+                "-c",
+                _STEP_SCRIPT,
+                "pyxis-step",
+                container_status_path,
+                str(timeout_s),
+                *argv,
+            ],
         )
-    except subprocess.TimeoutExpired as exc:
-        if failure_path is not None:
-            failure_path.touch()
-        raise RunnerError(
-            f"Pyxis step exceeded its {timeout_s + 30}s deadline and was killed"
-            + _srun_evidence(exc.output)
-        ) from exc
-    except (OSError, subprocess.SubprocessError) as exc:
-        if failure_path is not None:
-            failure_path.touch()
-        raise RunnerError(
-            "Pyxis infrastructure failure before the command completed: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    if status_path.read_text().strip() != f"finished:{result.returncode}":
-        if failure_path is not None:
-            failure_path.touch()
-        raise RunnerError(
-            "Pyxis infrastructure failure before the command completed "
-            f"(srun exited {result.returncode})" + _srun_evidence(result.stdout)
-        )
-    return result
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                timeout=timeout_s + SRUN_TEARDOWN_GRACE_S,
+                env=safe_srun_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            if failure_path is not None:
+                failure_path.touch()
+            raise RunnerError(
+                f"Pyxis step exceeded its "
+                f"{timeout_s + SRUN_TEARDOWN_GRACE_S}s deadline and was killed"
+                + _srun_evidence(exc.output)
+            ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            if failure_path is not None:
+                failure_path.touch()
+            raise RunnerError(
+                "Pyxis infrastructure failure before the command completed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if host_status_path.read_text().strip() != f"finished:{result.returncode}":
+            if failure_path is not None:
+                failure_path.touch()
+            raise RunnerError(
+                "Pyxis infrastructure failure before the command completed "
+                f"(srun exited {result.returncode})" + _srun_evidence(result.stdout)
+            )
+        return result
 
 
 #: Opt-in JSONL sink for container-create durations. Off unless set, so this
@@ -405,7 +418,7 @@ class PyxisEnvironment:
                         check=False,
                         capture_output=True,
                         text=True,
-                        timeout=30,
+                        timeout=PYXIS_CLEANUP_TIMEOUT_S,
                         env=safe_srun_env(),
                     )
                 except (OSError, RunnerError, subprocess.SubprocessError):

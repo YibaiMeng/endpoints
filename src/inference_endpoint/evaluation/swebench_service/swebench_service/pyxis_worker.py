@@ -53,6 +53,24 @@ exit 0
 """
 
 
+def _eval_infrastructure_failure_path(
+    output_dir: Path,
+    run_id: str,
+    prediction: dict[str, Any],
+    instance_id: str,
+) -> Path:
+    safe_model = prediction["model_name_or_path"].replace("/", "__")
+    return (
+        output_dir
+        / "logs"
+        / "run_evaluation"
+        / run_id
+        / safe_model
+        / instance_id
+        / _INFRASTRUCTURE_FAILURE
+    )
+
+
 def _run_agent(args: argparse.Namespace) -> None:
     # Generation-only dependencies are loaded only in the agent worker mode.
     from minisweagent.environments import get_environment
@@ -113,6 +131,10 @@ def _evaluate_instance(
     eval_path = log_dir / "eval.sh"
     output_path = log_dir / "test_output.txt"
     report_path = log_dir / "report.json"
+    failure_path = _eval_infrastructure_failure_path(
+        output_dir, run_id, prediction, instance_id
+    )
+    failure_path.unlink(missing_ok=True)
     patch_path.write_text(prediction["model_patch"])
     eval_path.write_text(test_spec.eval_script)
     output_path.write_text("")
@@ -124,13 +146,13 @@ def _evaluate_instance(
         (output_path, "/tmp/swebench_test_output.txt"),
     ]
     status_path = log_dir / ".mlperf_srun_status"
-    mounts.append((status_path, "/tmp/.mlperf_srun_status"))
     result = run_srun_step(
         image=image,
         mounts=mounts,
         workdir="/testbed",
         status_path=status_path,
         timeout_s=timeout_s + 30,
+        failure_path=failure_path,
         stderr=subprocess.PIPE,
         argv=[
             "bash",
@@ -174,6 +196,8 @@ def _run_eval(args: argparse.Namespace) -> None:
         load_swebench_dataset,
     )
 
+    failure_path = args.output_dir / _INFRASTRUCTURE_FAILURE
+    failure_path.unlink(missing_ok=True)
     predictions = {
         prediction["instance_id"]: prediction
         for prediction in get_predictions_from_file(
@@ -207,23 +231,43 @@ def _run_eval(args: argparse.Namespace) -> None:
         max_workers=args.max_workers
     ) as executor:
         futures = {
-            executor.submit(_evaluate_instance, **payload): payload[
-                "test_spec"
-            ].instance_id
+            executor.submit(_evaluate_instance, **payload): payload
             for payload in payloads
         }
-        failures = []
+        infrastructure_failures = []
+        evaluation_failures = []
         for future in concurrent.futures.as_completed(futures):
             try:
                 future.result()
             except Exception as exc:
                 with _PRINT_LOCK:
                     print(f"Pyxis evaluation failed: {exc}", flush=True)
-                failures.append(futures[future])
-        if failures:
+                payload = futures[future]
+                instance_id = payload["test_spec"].instance_id
+                instance_failure_path = _eval_infrastructure_failure_path(
+                    args.output_dir,
+                    args.run_id,
+                    payload["prediction"],
+                    instance_id,
+                )
+                target = (
+                    infrastructure_failures
+                    if instance_failure_path.exists()
+                    else evaluation_failures
+                )
+                target.append(instance_id)
+        if infrastructure_failures:
+            failure_path.touch()
+            detail = ", ".join(sorted(infrastructure_failures))
+            if evaluation_failures:
+                detail += "; SWE-bench evaluation failed for: " + ", ".join(
+                    sorted(evaluation_failures)
+                )
+            raise RunnerError("Pyxis infrastructure failure evaluating: " + detail)
+        if evaluation_failures:
             raise RunnerError(
-                "Pyxis infrastructure failure evaluating: "
-                + ", ".join(sorted(failures))
+                "SWE-bench evaluation failed for: "
+                + ", ".join(sorted(evaluation_failures))
             )
 
     output_dir = args.output_dir.resolve()

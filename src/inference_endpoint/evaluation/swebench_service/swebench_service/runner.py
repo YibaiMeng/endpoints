@@ -235,6 +235,8 @@ class RunnerProtocol(Protocol):
 
 
 class SweBenchRunner:
+    _cleanup_failure_is_fatal = False
+
     def __init__(
         self,
         *,
@@ -250,8 +252,11 @@ class SweBenchRunner:
         run_dir: Path,
         cancel_token: CancellationToken | None = None,
     ) -> dict[str, Any]:
+        succeeded = False
         try:
-            return self._run(request, run_dir, cancel_token)
+            result = self._run(request, run_dir, cancel_token)
+            succeeded = True
+            return result
         finally:
             try:
                 cleanup_kwargs: dict[str, Any] = {}
@@ -265,6 +270,8 @@ class SweBenchRunner:
                         }
                 self._cleanup_containers(run_dir.name, **cleanup_kwargs)
             except Exception:
+                if succeeded and self._cleanup_failure_is_fatal:
+                    raise
                 logger.warning(
                     "Could not clean up SWE-bench containers for run %s",
                     run_dir.name,
@@ -631,6 +638,8 @@ class SweBenchRunner:
 
 
 class PyxisSweBenchRunner(SweBenchRunner):
+    _cleanup_failure_is_fatal = True
+
     def __init__(
         self,
         *,
@@ -650,8 +659,8 @@ class PyxisSweBenchRunner(SweBenchRunner):
         # ``pull_timeout`` is the template's image-acquisition budget and is
         # exactly what the Pyxis container-create step needs, so it is carried
         # over rather than dropped. Without it the create step fell back to the
-        # per-command ``timeout`` (300s in both templates) and every image
-        # import slower than that was killed as an "infrastructure failure".
+        # per-command ``timeout`` and every image import slower than that was
+        # killed as an "infrastructure failure".
         # ``run_args``/``container_timeout`` stay dropped: both are docker-only.
         for key in ("run_args", "container_timeout"):
             environment_cfg.pop(key, None)
@@ -754,7 +763,11 @@ class PyxisSweBenchRunner(SweBenchRunner):
         instance_ids: list[str] | None = None,
     ) -> None:
         # Local import avoids the runner <-> Pyxis environment import cycle.
-        from .pyxis_environment import build_srun_command, safe_srun_env
+        from .pyxis_environment import (
+            PYXIS_CLEANUP_TIMEOUT_S,
+            build_srun_command,
+            safe_srun_env,
+        )
 
         del eval_run_id, instance_ids
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)[:24]
@@ -765,7 +778,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PYXIS_CLEANUP_TIMEOUT_S,
                 env=safe_srun_env(),
             )
             for line in listed.stdout.splitlines():
@@ -777,7 +790,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
                         check=True,
                         capture_output=True,
                         text=True,
-                        timeout=30,
+                        timeout=PYXIS_CLEANUP_TIMEOUT_S,
                         env=safe_srun_env(),
                     )
         except (OSError, subprocess.SubprocessError) as exc:

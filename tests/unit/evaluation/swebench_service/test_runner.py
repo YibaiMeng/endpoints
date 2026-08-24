@@ -18,6 +18,7 @@ from inference_endpoint.evaluation.swebench_service.swebench_service import (
     pyxis_worker as worker_mod,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service import (
+    pyxis_environment as pyxis_environment_mod,
     runner as runner_mod,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.pyxis_environment import (
@@ -495,6 +496,27 @@ def test_cleanup_failure_does_not_fail_successful_run(monkeypatch, tmp_path):
     assert result == {"resolved_instances": 1, "submitted_instances": 1}
 
 
+def test_pyxis_cleanup_failure_fails_successful_run(monkeypatch, tmp_path):
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_registry=_PYXIS_IMAGE_REGISTRY,
+    )
+    _stub_successful_run(monkeypatch, runner)
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_containers",
+        lambda run_id: (_ for _ in ()).throw(
+            RunnerError(
+                "failed to clean up Pyxis containers for SWE-bench run run-3"
+            )
+        ),
+    )
+
+    with pytest.raises(RunnerError, match="failed to clean up Pyxis containers"):
+        runner.run(_request(["http://endpoint:30000"]), tmp_path / "run-3")
+
+
 def test_cleanup_failure_does_not_mask_primary_failure(monkeypatch, tmp_path):
     runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
     monkeypatch.setattr(
@@ -618,11 +640,8 @@ def _finish_srun_step(command: list[str], returncode: int) -> None:
         return
     for mount in mount_argument.removeprefix("--container-mounts=").split(","):
         source, destination = mount.split(":", 1)
-        if destination == "/tmp/.mlperf_srun_status":
+        if destination.startswith("/tmp/.mlperf_srun_status."):
             Path(source).write_text(f"finished:{returncode}\n")
-            return
-        if destination == "/tmp":
-            Path(source, ".mlperf_srun_status").write_text(f"finished:{returncode}\n")
             return
     raise AssertionError("srun command does not mount its status file")
 
@@ -717,6 +736,44 @@ def test_pyxis_patch_config_selects_pyxis_environment(tmp_path):
     assert "container_timeout" not in environment
     # Carried over, not dropped: the Pyxis create step *is* the image pull.
     assert environment["pull_timeout"] == 3600
+
+
+def test_pyxis_qwen_command_preserves_inner_deadline_with_outer_grace(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        _finish_srun_step(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    qwen_template = yaml.safe_load(
+        (
+            Path(runner_mod.__file__).parent
+            / "templates"
+            / "swebench_qwen_tools_template.yaml"
+        ).read_text()
+    )
+    command_timeout_s = qwen_template["environment"]["timeout"]
+    environment = PyxisEnvironment(
+        image=tmp_path / "task.sqsh",
+        run_id="run-1",
+        timeout=command_timeout_s,
+    )
+
+    environment.execute({"command": "pytest -q"})
+    environment.cleanup()
+
+    assert command_timeout_s == 300
+    assert pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S == 300
+    assert pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S == 300
+    assert calls[1][1]["timeout"] == 600
+    assert "300" in calls[1][0]
+    assert calls[-1][1]["timeout"] == pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S
 
 
 def test_pyxis_resolves_registry_image_from_instance_id():
@@ -920,18 +977,28 @@ def test_pyxis_environment_mounts_persistent_tmp_on_every_step(monkeypatch, tmp_
     environment.execute({"command": "touch /tmp/state"})
     environment.execute({"command": "test -f /tmp/state"})
 
-    tmp_mounts = [
+    mount_specs = [
         next(arg for arg in command if arg.startswith("--container-mounts="))
+        .removeprefix("--container-mounts=")
+        .split(",")
         for command in calls[:3]
     ]
+    tmp_mounts = [
+        next(spec for spec in specs if spec.endswith(":/tmp"))
+        for specs in mount_specs
+    ]
     assert tmp_mounts[0] == tmp_mounts[1] == tmp_mounts[2]
-    source, destination = (
-        tmp_mounts[0].removeprefix("--container-mounts=").split(":", 1)
-    )
+    source, destination = tmp_mounts[0].split(":", 1)
     assert destination == "/tmp"
     persistent_tmp = Path(source)
     assert persistent_tmp.is_dir()
     assert stat.S_IMODE(persistent_tmp.stat().st_mode) == 0o1777
+    status_mounts = [
+        next(spec for spec in specs if ":/tmp/.mlperf_srun_status." in spec)
+        for specs in mount_specs
+    ]
+    assert len(set(status_mounts)) == 3
+    assert all(not spec.startswith(f"{persistent_tmp}/") for spec in status_mounts)
 
     environment.cleanup()
 
@@ -1070,7 +1137,10 @@ def test_pyxis_environment_raises_when_srun_never_starts_command(monkeypatch, tm
         ),
     )
 
-    with pytest.raises(RunnerError, match=r"exceeded its 60s deadline"):
+    with pytest.raises(
+        RunnerError,
+        match=rf"exceeded its {30 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S}s deadline",
+    ):
         environment.execute({"command": "pytest -q"})
 
     assert failure_path.exists()
@@ -1083,7 +1153,7 @@ def test_pyxis_container_create_uses_the_pull_budget_not_the_command_budget(
 
     Under Pyxis, `--container-image` triggers an enroot import of a multi-GB
     SWE-bench image from a remote registry. Charging that against the
-    per-command `timeout` (300s in both templates) killed the create step as
+    per-command `timeout` (300s for the default template) killed the create step as
     soon as enough concurrent workers shared the registry -- 96 srun steps of
     one 200-instance run were SIGKILLed at a uniform ~5m50s (= 300 + 30 grace),
     which the service reported as an undiagnosable "failed to start Pyxis
@@ -1108,8 +1178,8 @@ def test_pyxis_container_create_uses_the_pull_budget_not_the_command_budget(
     environment.execute({"command": "pytest -q"})
 
     create_timeout, command_timeout = timeouts[0], timeouts[1]
-    assert create_timeout == 3600 + 30
-    assert command_timeout == 300 + 30
+    assert create_timeout == 3600 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
+    assert command_timeout == 300 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
     assert create_timeout > command_timeout, (
         "container creation must not be bounded by the per-command timeout"
     )
@@ -1134,7 +1204,10 @@ def test_pyxis_container_create_budget_defaults_without_a_template_value(
         image=tmp_path / "task.sqsh", run_id="run-1", timeout=300
     )
 
-    assert timeouts[0] == 3600 + 30
+    assert (
+        timeouts[0]
+        == 3600 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
+    )
     environment.cleanup()
 
 
@@ -1329,10 +1402,10 @@ def test_pyxis_start_failure_removes_persistent_tmp(monkeypatch, tmp_path):
 def test_pyxis_cleanup_removes_only_exact_run_prefix(monkeypatch, tmp_path):
     monkeypatch.setenv("SLURM_JOB_ID", "1738605")
     monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
-    calls: list[list[str]] = []
+    calls: list[tuple[list[str], dict]] = []
 
     def fake_run(command, **kwargs):
-        calls.append(command)
+        calls.append((command, kwargs))
         output = ""
         if command[-3:] == ["enroot", "list", "-f"]:
             output = (
@@ -1352,8 +1425,12 @@ def test_pyxis_cleanup_removes_only_exact_run_prefix(monkeypatch, tmp_path):
 
     runner._cleanup_containers("run-1")
 
-    assert [command[-4:] for command in calls[1:]] == [
+    assert [command[-4:] for command, _ in calls[1:]] == [
         ["enroot", "remove", "-f", "pyxis_mswe_run-1_abcd1234"]
+    ]
+    assert [kwargs["timeout"] for _, kwargs in calls] == [
+        pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S,
+        pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S,
     ]
 
 
@@ -1690,13 +1767,18 @@ def test_pyxis_worker_propagates_evaluation_infrastructure_failure(
         sys.modules, "swebench.harness.test_spec.test_spec", test_spec_module
     )
     monkeypatch.setitem(sys.modules, "swebench.harness.utils", utils)
-    monkeypatch.setattr(
-        worker_mod,
-        "_evaluate_instance",
-        lambda **kwargs: (_ for _ in ()).throw(
-            RunnerError("Pyxis infrastructure failure")
-        ),
-    )
+    def fail_with_marker(**kwargs):
+        failure_path = worker_mod._eval_infrastructure_failure_path(
+            kwargs["output_dir"],
+            kwargs["run_id"],
+            kwargs["prediction"],
+            kwargs["test_spec"].instance_id,
+        )
+        failure_path.parent.mkdir(parents=True, exist_ok=True)
+        failure_path.touch()
+        raise RunnerError("Pyxis infrastructure failure")
+
+    monkeypatch.setattr(worker_mod, "_evaluate_instance", fail_with_marker)
 
     with pytest.raises(RunnerError, match="repo__repo-1"):
         worker_mod.main(
@@ -1720,3 +1802,70 @@ def test_pyxis_worker_propagates_evaluation_infrastructure_failure(
                 "repo__repo-1",
             ]
         )
+
+
+def test_pyxis_worker_preserves_non_infrastructure_evaluation_failure(
+    monkeypatch, tmp_path
+):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    predictions = {
+        "repo__repo-1": {
+            "model_name_or_path": "test-model",
+            "instance_id": "repo__repo-1",
+            "model_patch": "diff --git a/a b/a",
+        }
+    }
+
+    swebench = types.ModuleType("swebench")
+    harness = types.ModuleType("swebench.harness")
+    reporting = types.ModuleType("swebench.harness.reporting")
+    reporting.make_run_report = lambda *args, **kwargs: None
+    test_spec = types.ModuleType("swebench.harness.test_spec")
+    test_spec_module = types.ModuleType("swebench.harness.test_spec.test_spec")
+    test_spec_module.make_test_spec = lambda row, arch: types.SimpleNamespace(
+        instance_id=row["instance_id"], eval_script="pytest -q"
+    )
+    utils = types.ModuleType("swebench.harness.utils")
+    utils.get_predictions_from_file = lambda *args: predictions.values()
+    utils.load_swebench_dataset = lambda *args: [{"instance_id": "repo__repo-1"}]
+    monkeypatch.setitem(sys.modules, "swebench", swebench)
+    monkeypatch.setitem(sys.modules, "swebench.harness", harness)
+    monkeypatch.setitem(sys.modules, "swebench.harness.reporting", reporting)
+    monkeypatch.setitem(sys.modules, "swebench.harness.test_spec", test_spec)
+    monkeypatch.setitem(
+        sys.modules, "swebench.harness.test_spec.test_spec", test_spec_module
+    )
+    monkeypatch.setitem(sys.modules, "swebench.harness.utils", utils)
+    monkeypatch.setattr(
+        worker_mod,
+        "_evaluate_instance",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("malformed report")),
+    )
+
+    with pytest.raises(
+        RunnerError, match="SWE-bench evaluation failed for: repo__repo-1"
+    ):
+        worker_mod.main(
+            [
+                "eval",
+                "--dataset-name",
+                "princeton-nlp/SWE-bench_Verified",
+                "--split",
+                "test",
+                "--predictions-path",
+                str(output_dir / "preds.json"),
+                "--max-workers",
+                "1",
+                "--run-id",
+                "endpoints_test",
+                "--image-registry",
+                _PYXIS_IMAGE_REGISTRY,
+                "--output-dir",
+                str(output_dir),
+                "--instance-ids",
+                "repo__repo-1",
+            ]
+        )
+
+    assert not (output_dir / ".pyxis_infrastructure_failure").exists()

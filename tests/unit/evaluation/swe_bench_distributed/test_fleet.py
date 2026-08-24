@@ -9,6 +9,7 @@ import itertools
 
 import pytest
 
+from inference_endpoint.evaluation.swe_bench_distributed import fleet as fleet_mod
 from inference_endpoint.evaluation.swe_bench_distributed.fleet import (
     FleetDispatcher,
     accounted_and_resolved,
@@ -101,6 +102,7 @@ def dispatcher_for(queue, fleet, **overrides):
         "collect": fleet.collect,
         "fingerprint": fleet.fingerprint,
         "max_attempts": 3,
+        "env_fault_backoff_s": 0,
     }
     kwargs.update(overrides)
     return FleetDispatcher(**kwargs)
@@ -244,6 +246,104 @@ class TestEndpointFingerprint:
 
 
 class TestEnvironmentFaults:
+    def test_env_fault_checks_stall_before_backoff(self, queue, tmp_path, monkeypatch):
+        fleet = FakeFleet(queue, tmp_path)
+        first_submit = True
+        events: list[str] = []
+
+        def submit_with_one_environment_fault(service_url, unit):
+            nonlocal first_submit
+            if first_submit:
+                first_submit = False
+                raise OSError("service host is restarting")
+            return fleet.submit(service_url, unit)
+
+        monkeypatch.setattr(
+            FleetDispatcher,
+            "_check_stall",
+            lambda self, state: events.append("check"),
+        )
+        monkeypatch.setattr(
+            fleet_mod.time, "sleep", lambda delay: events.append("sleep")
+        )
+
+        dispatcher_for(
+            queue,
+            fleet,
+            service_urls=SERVICES[:1],
+            submit=submit_with_one_environment_fault,
+            env_fault_backoff_s=60,
+        ).run()
+
+        assert events[:2] == ["check", "sleep"]
+
+    def test_env_fault_backoff_follows_release_and_excludes_other_failures(
+        self, queue, tmp_path, monkeypatch
+    ):
+        fleet = FakeFleet(queue, tmp_path)
+        first_submit = True
+        first_poll = True
+        sleeps: list[int] = []
+
+        def submit_with_one_environment_fault(service_url, unit):
+            nonlocal first_submit
+            if first_submit:
+                first_submit = False
+                raise OSError("service host is restarting")
+            return fleet.submit(service_url, unit)
+
+        def poll_with_one_non_environment_failure(service_url, service_run_id):
+            nonlocal first_poll
+            if first_poll:
+                first_poll = False
+                return {"status": "failed", "error": "agent failed"}
+            return fleet.poll(service_url, service_run_id)
+
+        def record_sleep(delay):
+            # The faulted unit must be available to another service before this
+            # service waits; otherwise a delay holds fleet capacity hostage.
+            assert "run-a.s00" in queue.available_unit_ids()
+            sleeps.append(delay)
+
+        monkeypatch.setattr(fleet_mod.time, "sleep", record_sleep)
+
+        dispatcher_for(
+            queue,
+            fleet,
+            service_urls=SERVICES[:1],
+            submit=submit_with_one_environment_fault,
+            poll=poll_with_one_non_environment_failure,
+            env_fault_backoff_s=7,
+        ).run()
+
+        # The ordinary failed run retries too, but does not cause a backoff.
+        assert sleeps == [7]
+        assert queue.attempts("run-a.s00") == 1
+
+    def test_zero_env_fault_backoff_does_not_sleep(self, queue, tmp_path, monkeypatch):
+        fleet = FakeFleet(queue, tmp_path)
+        first_submit = True
+        sleeps: list[int] = []
+
+        def submit_with_one_environment_fault(service_url, unit):
+            nonlocal first_submit
+            if first_submit:
+                first_submit = False
+                raise OSError("service host is restarting")
+            return fleet.submit(service_url, unit)
+
+        monkeypatch.setattr(fleet_mod.time, "sleep", lambda delay: sleeps.append(delay))
+
+        dispatcher_for(
+            queue,
+            fleet,
+            service_urls=SERVICES[:1],
+            submit=submit_with_one_environment_fault,
+            env_fault_backoff_s=0,
+        ).run()
+
+        assert sleeps == []
+
     def test_a_submit_failure_does_not_charge_the_unit(self, queue, tmp_path):
         fleet = FakeFleet(queue, tmp_path)
         fleet.submit_errors[SERVICES[0]] = OSError("service host is broken")
@@ -256,6 +356,36 @@ class TestEnvironmentFaults:
         assert all(queue.attempts(unit_id) == 0 for unit_id in queue.plan.unit_ids)
         assert merge_run(queue, "run-a").total_instances == 30
 
+    def test_service_infrastructure_failure_does_not_charge_the_unit(
+        self, queue, tmp_path
+    ):
+        fleet = FakeFleet(queue, tmp_path)
+        first_poll = True
+
+        def poll_with_one_infrastructure_failure(service_url, service_run_id):
+            nonlocal first_poll
+            if first_poll:
+                first_poll = False
+                return {
+                    "status": "failed",
+                    "error": "Pyxis infrastructure failure",
+                    "infrastructure_failure": True,
+                }
+            return fleet.poll(service_url, service_run_id)
+
+        dispatcher_for(
+            queue,
+            fleet,
+            service_urls=SERVICES[:1],
+            poll=poll_with_one_infrastructure_failure,
+            max_attempts=1,
+        ).run()
+
+        # A counted first attempt would abandon this unit at max_attempts=1.
+        assert len(queue.completed_unit_ids()) == 3
+        assert queue.attempts("run-a.s00") == 0
+        assert merge_run(queue, "run-a").total_instances == 30
+
     def test_a_persistently_broken_service_is_quarantined(self, queue, tmp_path):
         fleet = FakeFleet(queue, tmp_path)
         fleet.submit_errors[SERVICES[0]] = OSError("service host is broken")
@@ -265,6 +395,28 @@ class TestEnvironmentFaults:
 
         assert SERVICES[0] in dispatcher.quarantined
         assert SERVICES[1] not in dispatcher.quarantined
+
+    def test_quarantined_service_skips_env_fault_backoff(
+        self, queue, tmp_path, monkeypatch
+    ):
+        fleet = FakeFleet(queue, tmp_path)
+        fleet.submit_errors[SERVICES[0]] = OSError("service host is broken")
+        sleeps: list[int] = []
+        monkeypatch.setattr(fleet_mod.time, "sleep", lambda delay: sleeps.append(delay))
+
+        dispatcher = dispatcher_for(
+            queue,
+            fleet,
+            service_urls=SERVICES[:1],
+            max_consecutive_env_faults=2,
+            env_fault_backoff_s=7,
+        )
+        dispatcher.run()
+
+        # The first fault retries after the configured delay; the second
+        # quarantines this sole service and therefore must not delay shutdown.
+        assert SERVICES[0] in dispatcher.quarantined
+        assert sleeps == [7]
 
 
 class TestStallQuarantine:

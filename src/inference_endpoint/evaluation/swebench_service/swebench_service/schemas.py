@@ -92,5 +92,6 @@ class RunStatus(BaseModel):
     eval_completed: int | None = None
     message: str | None = None
     error: str | None = None
+    infrastructure_failure: bool = False
     result: dict[str, Any] | None = None
     artifacts: list[ArtifactInfo] = Field(default_factory=list)
