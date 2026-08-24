@@ -8,8 +8,10 @@ from __future__ import annotations
 import pytest
 
 from inference_endpoint.config.schema import ScorerMethod
+from inference_endpoint.evaluation import swe_bench_fleet_scorer as fleet_scorer_mod
 from inference_endpoint.evaluation.scoring import Scorer
 from inference_endpoint.evaluation.swe_bench_fleet_scorer import SWEBenchFleetScorer
+from inference_endpoint.evaluation.swe_bench_scorer import SWEBenchScorer
 from inference_endpoint.exceptions import SetupError
 
 pytestmark = pytest.mark.unit
@@ -76,3 +78,73 @@ class TestOptions:
             SWEBenchFleetScorer._resolve_options(
                 {"swebench_service_urls": URLS, "shard_size": 0}
             )
+
+
+class TestPollUnit:
+    @staticmethod
+    def _scorer(*, service_timeout_s: float = 10.0) -> SWEBenchFleetScorer:
+        scorer = object.__new__(SWEBenchFleetScorer)
+        scorer.options = {
+            "auth_token": None,
+            "poll_interval_s": 0.0,
+            "service_timeout_s": service_timeout_s,
+        }
+        return scorer
+
+    def test_timeouts_continue_polling_the_same_service_run(self, monkeypatch):
+        calls: list[str] = []
+        responses = iter([TimeoutError(), {"status": "succeeded"}])
+        cancel_calls: list[tuple[str, str, str | None]] = []
+
+        def fake_http_json(url, **kwargs):
+            calls.append(url)
+            response = next(responses)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+        monkeypatch.setattr(SWEBenchScorer, "_http_json", fake_http_json)
+        monkeypatch.setattr(
+            SWEBenchScorer,
+            "_cancel_service_run",
+            lambda *args: cancel_calls.append(args),
+        )
+        monkeypatch.setattr(fleet_scorer_mod.time, "sleep", lambda _: None)
+        monotonic = iter([0.0, 0.0, 1.0])
+        monkeypatch.setattr(
+            fleet_scorer_mod.time, "monotonic", lambda: next(monotonic)
+        )
+
+        status = self._scorer()._poll_unit("http://svc-a:18080/", "run-42")
+
+        assert status == {"status": "succeeded"}
+        assert calls == [
+            "http://svc-a:18080/v1/runs/run-42",
+            "http://svc-a:18080/v1/runs/run-42",
+        ]
+        assert cancel_calls == []
+
+    def test_timeout_deadline_still_cancels_after_a_poll_timeout(self, monkeypatch):
+        cancel_calls: list[tuple[str, str, str | None]] = []
+
+        def timeout_http_json(url, **kwargs):
+            raise TimeoutError
+
+        monkeypatch.setattr(SWEBenchScorer, "_http_json", timeout_http_json)
+        monkeypatch.setattr(
+            SWEBenchScorer,
+            "_cancel_service_run",
+            lambda *args: cancel_calls.append(args),
+        )
+        monkeypatch.setattr(fleet_scorer_mod.time, "sleep", lambda _: None)
+        monotonic = iter([0.0, 0.0, 1.0])
+        monkeypatch.setattr(
+            fleet_scorer_mod.time, "monotonic", lambda: next(monotonic)
+        )
+
+        with pytest.raises(SetupError, match="timed out waiting"):
+            self._scorer(service_timeout_s=1.0)._poll_unit(
+                "http://svc-a:18080/", "run-42"
+            )
+
+        assert cancel_calls == [("http://svc-a:18080/", "run-42", None)]

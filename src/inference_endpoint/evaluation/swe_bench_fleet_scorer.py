@@ -371,11 +371,14 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
                     f"timed out waiting for {service_url} run {service_run_id}"
                 )
             time.sleep(self.options["poll_interval_s"])
-            status = SWEBenchScorer._http_json(
-                urljoin(service_url, f"v1/runs/{service_run_id}"),
-                timeout_s=30.0,
-                auth_token=self.options["auth_token"],
-            )
+            try:
+                status = SWEBenchScorer._http_json(
+                    urljoin(service_url, f"v1/runs/{service_run_id}"),
+                    timeout_s=30.0,
+                    auth_token=self.options["auth_token"],
+                )
+            except TimeoutError:
+                continue
         return status
 
     def _collect_unit(
