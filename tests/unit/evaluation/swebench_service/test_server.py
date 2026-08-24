@@ -20,6 +20,7 @@ from inference_endpoint.evaluation.swebench_service.swebench_service.schemas imp
     RunStatus,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.runner import (
+    EndpointOutageError,
     RunCancelled,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.server import (
@@ -61,6 +62,22 @@ class PyxisFailureRunner:
             output_dir.mkdir()
             (output_dir / ".pyxis_infrastructure_failure").touch()
         raise RuntimeError(self.error)
+
+
+class EndpointOutageRunner:
+    def run(self, request, run_dir: Path, cancel_token=None):
+        raise EndpointOutageError("endpoint outage during agent execution")
+
+
+class CancellationRaceEndpointOutageRunner:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, request, run_dir: Path, cancel_token=None):
+        self.started.set()
+        assert self.release.wait(2)
+        raise EndpointOutageError("endpoint outage during agent execution")
 
 
 class AgentProgressRunner:
@@ -474,6 +491,52 @@ async def test_runner_reports_pyxis_infrastructure_failure(marker, error, tmp_pa
 
     assert status["status"] == "failed"
     assert status["infrastructure_failure"] is True
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_endpoint_outage_as_infrastructure_failure(tmp_path):
+    client = await _client(tmp_path, EndpointOutageRunner())
+    try:
+        submit = await client.post("/v1/runs", json=_payload())
+        submitted = await submit.json()
+        for _ in range(20):
+            status_resp = await client.get(f"/v1/runs/{submitted['run_id']}")
+            status = await status_resp.json()
+            if status["status"] == "failed":
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await client.close()
+
+    assert status["status"] == "failed"
+    assert status["infrastructure_failure"] is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_endpoint_outage_transitions_to_cancelled(tmp_path):
+    runner = CancellationRaceEndpointOutageRunner()
+    client = await _client(tmp_path, runner)
+    try:
+        submit = await client.post("/v1/runs", json=_payload())
+        submitted = await submit.json()
+        assert await asyncio.to_thread(runner.started.wait, 2)
+
+        cancelled_resp = await client.post(f"/v1/runs/{submitted['run_id']}/cancel")
+        cancelled = await cancelled_resp.json()
+        assert cancelled["status"] == "running"
+
+        runner.release.set()
+        for _ in range(20):
+            status_resp = await client.get(f"/v1/runs/{submitted['run_id']}")
+            status = await status_resp.json()
+            if status["status"] == "cancelled":
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await client.close()
+
+    assert status["status"] == "cancelled"
+    assert status["infrastructure_failure"] is False
 
 
 @pytest.mark.asyncio

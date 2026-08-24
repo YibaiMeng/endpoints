@@ -43,6 +43,10 @@ class RunnerError(RuntimeError):
     pass
 
 
+class EndpointOutageError(RunnerError):
+    pass
+
+
 class RunCancelled(RunnerError):
     pass
 
@@ -298,21 +302,28 @@ class SweBenchRunner:
         if output_dir.exists():
             shutil.rmtree(output_dir)
         output_dir.mkdir(parents=True)
-
         with tempfile.TemporaryDirectory(prefix="swebench_config_") as config_tmp:
             patched_config = self._patch_config(
                 Path(config_tmp),
                 request,
                 run_id=run_dir.name,
             )
-            self._run_agent(
-                request,
-                patched_config,
-                output_dir,
-                run_dir,
-                secret_values,
-                cancel_token,
-            )
+            try:
+                self._run_agent(
+                    request,
+                    patched_config,
+                    output_dir,
+                    run_dir,
+                    secret_values,
+                    cancel_token,
+                )
+            except RunCancelled:
+                raise
+            except Exception:
+                self._raise_endpoint_outage_if_present(output_dir)
+                raise
+
+        self._raise_endpoint_outage_if_present(output_dir)
 
         preds_path = output_dir / "preds.json"
         if not preds_path.exists():
@@ -325,6 +336,27 @@ class SweBenchRunner:
         )
         shutil.copy2(result_path, run_dir / "swe_bench_results.json")
         return msgspec.json.decode(result_path.read_bytes(), type=dict)
+
+    @staticmethod
+    def _raise_endpoint_outage_if_present(output_dir: Path) -> None:
+        exit_statuses = sorted(
+            output_dir.glob("exit_statuses_*.yaml"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        if not exit_statuses:
+            return
+        try:
+            loaded = yaml.safe_load(exit_statuses[-1].read_text(errors="replace")) or {}
+        except (OSError, yaml.YAMLError):
+            return
+        if not isinstance(loaded, dict):
+            return
+        instances_by_status = loaded.get("instances_by_exit_status")
+        if (
+            isinstance(instances_by_status, dict)
+            and instances_by_status.get("ServiceUnavailableError")
+        ):
+            raise EndpointOutageError("endpoint outage during agent execution")
 
     def _load_template(self, request: RunRequest) -> dict[str, Any]:
         template_path = self._template_dir / TEMPLATE_FILES[request.template]

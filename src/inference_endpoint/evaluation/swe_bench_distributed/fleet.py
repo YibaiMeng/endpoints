@@ -225,7 +225,7 @@ class FleetDispatcher:
             if status.get("infrastructure_failure") is True:
                 base.outcome = UnitOutcome.ENV_FAULT
                 base.detail = (
-                    "service run ended with a Pyxis infrastructure failure: "
+                    "service run ended with an infrastructure failure: "
                     f"{status.get('error')}"
                 )
                 return DispatchOutcome(result=base, terminal=False)

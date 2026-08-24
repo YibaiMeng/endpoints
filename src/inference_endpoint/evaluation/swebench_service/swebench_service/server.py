@@ -38,7 +38,13 @@ from .artifacts import (
     resolve_artifact,
 )
 from .config import ServiceConfig
-from .runner import CancellationToken, RunCancelled, RunnerProtocol, SweBenchRunner
+from .runner import (
+    CancellationToken,
+    EndpointOutageError,
+    RunCancelled,
+    RunnerProtocol,
+    SweBenchRunner,
+)
 from .schemas import ArtifactInfo, RunRequest, RunStatus
 
 _TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
@@ -163,6 +169,22 @@ class RunManager:
                 except RunCancelled:
                     await self._transition(
                         run_id, status="cancelled", phase="cancelled"
+                    )
+                    return
+                except EndpointOutageError as exc:
+                    if token.is_cancelled():
+                        await self._transition(
+                            run_id, status="cancelled", phase="cancelled"
+                        )
+                        return
+                    await self._transition(
+                        run_id,
+                        status="failed",
+                        phase="failed",
+                        infrastructure_failure=True,
+                        error=redact_text(
+                            str(exc), self._secret_values.get(run_id, set())
+                        ),
                     )
                     return
                 except Exception as exc:

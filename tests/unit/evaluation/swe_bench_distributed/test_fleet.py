@@ -368,7 +368,7 @@ class TestEnvironmentFaults:
                 first_poll = False
                 return {
                     "status": "failed",
-                    "error": "Pyxis infrastructure failure",
+                    "error": "endpoint outage during agent execution",
                     "infrastructure_failure": True,
                 }
             return fleet.poll(service_url, service_run_id)

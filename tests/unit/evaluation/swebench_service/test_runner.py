@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 import stat
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from inference_endpoint.evaluation.swebench_service.swebench_service.pyxis_envir
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.runner import (
     CancellationToken,
+    EndpointOutageError,
     PyxisSweBenchRunner,
     RunCancelled,
     RunnerError,
@@ -331,6 +333,140 @@ def test_validate_prediction_ids_logs_missing_instances(tmp_path, caplog):
 
     assert "omitted predictions" in caplog.text
     assert "repo__repo-2" in caplog.text
+
+
+@pytest.mark.parametrize("agent_raises", [False, True])
+def test_run_classifies_terminal_service_unavailable_status_before_prediction_validation(
+    monkeypatch, tmp_path, agent_raises
+):
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    def fake_run_agent(
+        request, patched_config, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        (output_dir / "exit_statuses_0001.yaml").write_text(
+            "instances_by_exit_status:\n"
+            "  ServiceUnavailableError:\n"
+            "    - repo__repo-1\n"
+        )
+        if agent_raises:
+            raise RunnerError("agent exited unsuccessfully")
+
+    monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    with pytest.raises(EndpointOutageError, match="endpoint outage"):
+        runner.run(_request(["http://endpoint:30000"]), tmp_path / "run")
+
+
+def test_run_ignores_transient_agent_log_outages_when_final_status_is_submitted(
+    monkeypatch, tmp_path
+):
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    def fake_run_agent(
+        request, patched_config, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        (run_dir / "swe_bench_agent.log").write_text(
+            "ServiceUnavailableError: Error code: 503\n"
+            "ServiceUnavailableError: no_available_workers\n"
+            "All workers are unavailable (circuit breaker open or unhealthy)\n"
+        )
+        (output_dir / "exit_statuses_0001.yaml").write_text(
+            "instances_by_exit_status:\n"
+            "  Submitted:\n"
+            "    - repo__repo-1\n"
+        )
+        (output_dir / "preds.json").write_text('{"repo__repo-1":"patch"}')
+
+    def fake_run_eval(
+        request, preds_path, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        result_path = output_dir / "result.json"
+        result_path.write_text('{"resolved_instances":1,"submitted_instances":1}')
+        return result_path
+
+    monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_run_eval", fake_run_eval)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    result = runner.run(_request(["http://endpoint:30000"]), tmp_path / "run")
+
+    assert result == {"resolved_instances": 1, "submitted_instances": 1}
+
+
+def test_run_ignores_stale_service_unavailable_exit_status(monkeypatch, tmp_path):
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    def fake_run_agent(
+        request, patched_config, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        stale_path = output_dir / "exit_statuses_0001.yaml"
+        stale_path.write_text(
+            "instances_by_exit_status:\n"
+            "  ServiceUnavailableError:\n"
+            "    - repo__repo-1\n"
+        )
+        final_path = output_dir / "exit_statuses_0002.yaml"
+        final_path.write_text(
+            "instances_by_exit_status:\n"
+            "  Submitted:\n"
+            "    - repo__repo-1\n"
+        )
+        os.utime(stale_path, (1, 1))
+        os.utime(final_path, (2, 2))
+        (output_dir / "preds.json").write_text('{"repo__repo-1":"patch"}')
+
+    def fake_run_eval(
+        request, preds_path, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        result_path = output_dir / "result.json"
+        result_path.write_text('{"resolved_instances":1,"submitted_instances":1}')
+        return result_path
+
+    monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_run_eval", fake_run_eval)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    result = runner.run(_request(["http://endpoint:30000"]), tmp_path / "run")
+
+    assert result == {"resolved_instances": 1, "submitted_instances": 1}
+
+
+def test_run_classifies_mixed_terminal_service_unavailable_statuses(
+    monkeypatch, tmp_path
+):
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    def fake_run_agent(
+        request, patched_config, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        (output_dir / "exit_statuses_0001.yaml").write_text(
+            "instances_by_exit_status:\n"
+            "  Submitted:\n"
+            "    - repo__repo-1\n"
+            "  ServiceUnavailableError:\n"
+            "    - repo__repo-2\n"
+        )
+
+    monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    with pytest.raises(EndpointOutageError, match="endpoint outage"):
+        runner.run(_request(["http://endpoint:30000"]), tmp_path / "run")
+
+
+def test_run_preserves_agent_error_without_terminal_outage_status(monkeypatch, tmp_path):
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    def fake_run_agent(*args, **kwargs):
+        raise RunnerError("agent failed after transient ServiceUnavailableError")
+
+    monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    with pytest.raises(RunnerError, match="agent failed"):
+        runner.run(_request(["http://endpoint:30000"]), tmp_path / "run")
 
 
 def test_logged_subprocess_publishes_redacted_log(tmp_path):
