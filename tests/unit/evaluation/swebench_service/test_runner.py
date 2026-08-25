@@ -883,6 +883,20 @@ def test_pyxis_patch_config_selects_pyxis_environment(tmp_path):
     assert environment["pull_timeout"] == 3600
 
 
+def test_pyxis_patch_config_overrides_command_timeout(tmp_path):
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_registry=_PYXIS_IMAGE_REGISTRY,
+        command_timeout_s=3600,
+    )
+
+    patched = runner._patch_config(tmp_path, _pyxis_request(), run_id="run-1")
+
+    environment = yaml.safe_load(patched.read_text())["environment"]
+    assert environment["timeout"] == 3600
+
+
 def test_pyxis_qwen_command_preserves_inner_deadline_with_outer_grace(
     monkeypatch, tmp_path
 ):

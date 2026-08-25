@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--subprocess-timeout-s", type=int, default=24 * 60 * 60)
     parser.add_argument("--runtime", choices=("docker", "pyxis"), default="docker")
     parser.add_argument("--image-registry")
+    parser.add_argument("--pyxis-command-timeout-s", type=int)
     auth_group = parser.add_mutually_exclusive_group()
     auth_group.add_argument("--auth-token")
     auth_group.add_argument("--allow-unauthenticated", action="store_true")
@@ -55,6 +56,7 @@ def main() -> None:
         project_root=Path(__file__).resolve().parents[1],
         subprocess_timeout_s=config.subprocess_timeout_s,
         image_registry=args.image_registry,
+        pyxis_command_timeout_s=args.pyxis_command_timeout_s,
     )
     web.run_app(create_app(config, runner=runner), host=config.host, port=config.port)
 

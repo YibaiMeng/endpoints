@@ -678,12 +678,14 @@ class PyxisSweBenchRunner(SweBenchRunner):
         project_root: Path,
         subprocess_timeout_s: int,
         image_registry: str,
+        command_timeout_s: int | None = None,
     ):
         super().__init__(
             project_root=project_root,
             subprocess_timeout_s=subprocess_timeout_s,
         )
         self.image_registry = image_registry
+        self.command_timeout_s = command_timeout_s
 
     def _configure_environment(
         self, environment_cfg: dict[str, Any], run_id: str
@@ -700,6 +702,8 @@ class PyxisSweBenchRunner(SweBenchRunner):
             "swebench_service.pyxis_environment.PyxisEnvironment"
         )
         environment_cfg["run_id"] = run_id
+        if self.command_timeout_s is not None:
+            environment_cfg["timeout"] = self.command_timeout_s
 
     def _run_agent(
         self,
@@ -837,6 +841,7 @@ def create_runner(
     project_root: Path,
     subprocess_timeout_s: int,
     image_registry: str | None,
+    pyxis_command_timeout_s: int | None = None,
 ) -> RunnerProtocol:
     if runtime == "docker":
         return SweBenchRunner(
@@ -850,5 +855,6 @@ def create_runner(
             project_root=project_root,
             subprocess_timeout_s=subprocess_timeout_s,
             image_registry=image_registry,
+            command_timeout_s=pyxis_command_timeout_s,
         )
     raise ValueError(f"unknown SWE-bench runtime: {runtime}")
