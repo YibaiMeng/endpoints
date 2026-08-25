@@ -382,6 +382,7 @@ def build_gates(
     expected_model: str | None,
     tool_call_model: str | None,
     min_prompt_tokens: int,
+    tool_call_timeout_s: float = 180.0,
     api_key: str | None = None,
 ) -> tuple[list[Gate], EndpointFingerprintGate]:
     """Assemble the pre-dispatch gates.
@@ -398,6 +399,7 @@ def build_gates(
             ToolCallGate(
                 tool_call_model,
                 min_prompt_tokens=min_prompt_tokens,
+                timeout_s=tool_call_timeout_s,
                 api_key=api_key,
             )
         )

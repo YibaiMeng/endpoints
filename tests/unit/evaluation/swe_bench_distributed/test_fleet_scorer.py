@@ -13,6 +13,8 @@ from inference_endpoint.config.schema import ScorerMethod
 from inference_endpoint.evaluation import swe_bench_fleet_scorer as fleet_scorer_mod
 from inference_endpoint.evaluation.scoring import Scorer
 from inference_endpoint.evaluation.swe_bench_fleet_scorer import SWEBenchFleetScorer
+from inference_endpoint.evaluation.swe_bench_distributed.fleet import build_gates
+from inference_endpoint.evaluation.swe_bench_distributed.gates import ToolCallGate
 from inference_endpoint.evaluation.swe_bench_scorer import SWEBenchScorer
 from inference_endpoint.exceptions import SetupError
 
@@ -76,6 +78,13 @@ class TestOptions:
         assert options["env_fault_backoff_s"] == 60
         # The tool-call gate's floor must stay at SWE-bench prompt scale.
         assert options["min_prompt_tokens"] == 2000
+        assert options["tool_call_timeout_s"] == 180
+
+    def test_tool_call_timeout_must_be_positive(self):
+        with pytest.raises(SetupError, match="tool_call_timeout_s"):
+            SWEBenchFleetScorer._resolve_options(
+                {"swebench_service_urls": URLS, "tool_call_timeout_s": 0}
+            )
 
     def test_a_bad_shard_size_is_rejected(self):
         with pytest.raises(SetupError, match="shard_size"):
@@ -99,6 +108,7 @@ class TestOptions:
 class TestDispatcherConfiguration:
     def test_environment_fault_options_are_forwarded(self, monkeypatch, tmp_path):
         captured: dict[str, object] = {}
+        gate_options: dict[str, object] = {}
 
         class FakeDispatcher:
             quarantined: dict[str, str] = {}
@@ -116,6 +126,7 @@ class TestDispatcherConfiguration:
                 "swebench_service_urls": URLS,
                 "max_consecutive_env_faults": 5,
                 "env_fault_backoff_s": 17,
+                "tool_call_timeout_s": 321,
             }
         )
 
@@ -133,7 +144,10 @@ class TestDispatcherConfiguration:
         monkeypatch.setattr(
             fleet_scorer_mod,
             "build_gates",
-            lambda **_: ([], SimpleNamespace(fingerprint=lambda _: "fingerprint")),
+            lambda **kwargs: (
+                gate_options.update(kwargs) or [],
+                SimpleNamespace(fingerprint=lambda _: "fingerprint"),
+            ),
         )
         monkeypatch.setattr(fleet_scorer_mod, "run_gates", lambda *_: None)
         monkeypatch.setattr(
@@ -162,6 +176,43 @@ class TestDispatcherConfiguration:
         assert scorer.score() == (1.0, 1)
         assert captured["max_consecutive_env_faults"] == 5
         assert captured["env_fault_backoff_s"] == 17
+        assert gate_options["tool_call_timeout_s"] == 321
+
+
+class TestGateConfiguration:
+    def test_tool_call_timeout_is_applied_only_to_the_tool_call_gate(self):
+        gates, _ = build_gates(
+            expected_model="Org/Model",
+            tool_call_model="Org/Model",
+            min_prompt_tokens=2000,
+            tool_call_timeout_s=321,
+        )
+        tool_call_gate = next(gate for gate in gates if isinstance(gate, ToolCallGate))
+        assert tool_call_gate.timeout_s == 321
+
+    def test_preflight_forwards_the_tool_call_timeout(self, monkeypatch):
+        gate_options: dict[str, object] = {}
+        monkeypatch.setattr(SWEBenchScorer, "_check_health", lambda *_: None)
+        monkeypatch.setattr(
+            fleet_scorer_mod,
+            "build_gates",
+            lambda **kwargs: (
+                gate_options.update(kwargs) or [],
+                SimpleNamespace(fingerprint=lambda _: "fingerprint"),
+            ),
+        )
+        monkeypatch.setattr(fleet_scorer_mod, "run_gates", lambda *_: None)
+
+        SWEBenchFleetScorer.preflight(
+            {
+                "swebench_service_urls": URLS,
+                "endpoint_urls": ["http://endpoint"],
+                "model_name": "Org/Model",
+                "tool_call_timeout_s": 321,
+            }
+        )
+
+        assert gate_options["tool_call_timeout_s"] == 321
 
 
 class TestPollUnit:

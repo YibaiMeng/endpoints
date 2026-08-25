@@ -67,6 +67,7 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
     DEFAULT_MAX_CONSECUTIVE_ENV_FAULTS: ClassVar[int] = 3
     DEFAULT_ENV_FAULT_BACKOFF_S: ClassVar[int] = 60
     DEFAULT_MIN_PROMPT_TOKENS: ClassVar[int] = 2000
+    DEFAULT_TOOL_CALL_TIMEOUT_S: ClassVar[int] = 180
     DEFAULT_STALL_TIMEOUT_S: ClassVar[int] = 3 * 60 * 60
     DEFAULT_SERVICE_TIMEOUT_S: ClassVar[int] = 24 * 60 * 60
     DEFAULT_POLL_INTERVAL_S: ClassVar[float] = 5.0
@@ -159,6 +160,12 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
             default=cls.DEFAULT_MIN_PROMPT_TOKENS,
             min_value=0,
         )
+        options["tool_call_timeout_s"] = SWEBenchScorer._get_extra_int(
+            extras,
+            "tool_call_timeout_s",
+            default=cls.DEFAULT_TOOL_CALL_TIMEOUT_S,
+            min_value=1,
+        )
         options["stall_timeout_s"] = SWEBenchScorer._get_extra_int(
             extras,
             "stall_timeout_s",
@@ -218,6 +225,7 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
             expected_model=options["expected_model"],
             tool_call_model=extras.get("model_name"),
             min_prompt_tokens=options["min_prompt_tokens"],
+            tool_call_timeout_s=options["tool_call_timeout_s"],
             api_key=extras.get("endpoint_api_key"),
         )
         try:
@@ -254,6 +262,7 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
             expected_model=self.options["expected_model"],
             tool_call_model=model_name,
             min_prompt_tokens=self.options["min_prompt_tokens"],
+            tool_call_timeout_s=self.options["tool_call_timeout_s"],
             api_key=endpoint_config.get("api_key"),
         )
         try:
