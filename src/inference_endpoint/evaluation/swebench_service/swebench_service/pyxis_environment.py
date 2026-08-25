@@ -55,6 +55,12 @@ _STEP_STATUS = "/tmp/.mlperf_srun_status"
 # tearing it down when the cluster is under contention. This is intentionally
 # separate from the command deadline passed to GNU timeout in _STEP_SCRIPT.
 SRUN_TEARDOWN_GRACE_S = 300
+# Ordinary commands can spend ten minutes waiting for a nested Slurm/Pyxis
+# step after their inner command deadline has expired.  Give those workload
+# steps a larger admission/teardown budget without extending the command
+# itself.  Container creation already has its own pull budget, and host-only
+# calls do not have Pyxis admission overhead, so both retain the base grace.
+SRUN_PYXIS_WORKLOAD_TEARDOWN_GRACE_S = 900
 PYXIS_CLEANUP_TIMEOUT_S = 300
 _STEP_SCRIPT = r"""set +e
 status_path=$1
@@ -136,7 +142,13 @@ def run_srun_step(
     # The workload must not share a predictable status file with the host. A
     # test that removes or rewrites that file would otherwise look exactly like
     # an srun/Pyxis failure. Mount a fresh host-only file at a per-step path.
-    total_timeout_s = timeout_s + SRUN_TEARDOWN_GRACE_S
+    is_pyxis_workload = (image is None) != (name is None)
+    teardown_grace_s = (
+        SRUN_PYXIS_WORKLOAD_TEARDOWN_GRACE_S
+        if is_pyxis_workload
+        else SRUN_TEARDOWN_GRACE_S
+    )
+    total_timeout_s = timeout_s + teardown_grace_s
     deadline = time.monotonic() + total_timeout_s
     for attempt in range(2):
         with tempfile.TemporaryDirectory(prefix="mlperf_srun_status_") as status_tmp:

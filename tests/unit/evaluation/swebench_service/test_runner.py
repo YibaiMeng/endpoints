@@ -915,10 +915,74 @@ def test_pyxis_qwen_command_preserves_inner_deadline_with_outer_grace(
 
     assert command_timeout_s == 300
     assert pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S == 300
+    assert pyxis_environment_mod.SRUN_PYXIS_WORKLOAD_TEARDOWN_GRACE_S == 900
     assert pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S == 300
-    assert 0 < calls[1][1]["timeout"] <= 600
+    assert 0 < calls[1][1]["timeout"] <= 1200
     assert "300" in calls[1][0]
     assert calls[-1][1]["timeout"] == pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    ("mode", "uses_workload_grace"),
+    [
+        ("image", True),
+        ("name", True),
+        ("image_and_name", False),
+        ("host", False),
+    ],
+)
+def test_pyxis_outer_grace_is_scoped_to_workload_steps(
+    monkeypatch, tmp_path, mode, uses_workload_grace
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    monkeypatch.setattr(pyxis_environment_mod.time, "monotonic", lambda: 100.0)
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if mode != "host":
+            _finish_srun_step(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_kwargs = {
+        "image": {"image": tmp_path / "task.sqsh"},
+        "name": {"name": "existing-container"},
+        "image_and_name": {
+            "image": tmp_path / "task.sqsh",
+            "name": "new-container",
+        },
+        "host": {},
+    }[mode]
+
+    if mode == "host":
+        with pytest.raises(RunnerError, match="before the command completed"):
+            run_srun_step(
+                argv=["true"],
+                status_path=Path(pyxis_environment_mod._STEP_STATUS),
+                timeout_s=30,
+                **run_kwargs,
+            )
+    else:
+        assert (
+            run_srun_step(
+                argv=["true"],
+                status_path=Path(pyxis_environment_mod._STEP_STATUS),
+                timeout_s=30,
+                **run_kwargs,
+            ).returncode
+            == 0
+        )
+
+    grace_s = (
+        pyxis_environment_mod.SRUN_PYXIS_WORKLOAD_TEARDOWN_GRACE_S
+        if uses_workload_grace
+        else pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
+    )
+    assert len(calls) == 1
+    assert calls[0][1]["timeout"] == 30 + grace_s
+    assert "30" in calls[0][0]
 
 
 def test_pyxis_resolves_registry_image_from_instance_id():
@@ -1274,21 +1338,24 @@ def test_pyxis_environment_raises_when_srun_never_starts_command(monkeypatch, tm
 
     monkeypatch.setenv("SLURM_JOB_ID", "1738605")
     monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: (_ for _ in ()).throw(
-            subprocess.TimeoutExpired(command, 30)
-        ),
-    )
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(command, 30)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     with pytest.raises(
         RunnerError,
-        match=rf"exceeded its {30 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S}s deadline",
+        match=rf"exceeded its "
+        rf"{30 + pyxis_environment_mod.SRUN_PYXIS_WORKLOAD_TEARDOWN_GRACE_S}s deadline",
     ):
         environment.execute({"command": "pytest -q"})
 
     assert failure_path.exists()
+    assert calls == 1
 
 
 @pytest.mark.parametrize(
@@ -1397,7 +1464,7 @@ def test_pyxis_retry_uses_only_the_remaining_original_deadline(monkeypatch, tmp_
         ).returncode
         == 0
     )
-    assert timeouts == [330.0, 300.0]
+    assert timeouts == [930.0, 900.0]
 
 
 def test_pyxis_skips_retry_when_the_original_deadline_is_exhausted(
@@ -1405,7 +1472,7 @@ def test_pyxis_skips_retry_when_the_original_deadline_is_exhausted(
 ):
     monkeypatch.setenv("SLURM_JOB_ID", "1738605")
     monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
-    monotonic_times = iter((0.0, 0.0, 330.0))
+    monotonic_times = iter((0.0, 0.0, 930.0))
     monkeypatch.setattr(pyxis_environment_mod.time, "monotonic", lambda: next(monotonic_times))
     failure_path = tmp_path / ".pyxis_infrastructure_failure"
     calls = 0
@@ -1419,7 +1486,7 @@ def test_pyxis_skips_retry_when_the_original_deadline_is_exhausted(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    with pytest.raises(RunnerError, match=r"exceeded its 330s deadline before retry"):
+    with pytest.raises(RunnerError, match=r"exceeded its 930s deadline before retry"):
         run_srun_step(
             argv=["true"],
             status_path=Path(pyxis_environment_mod._STEP_STATUS),
@@ -1566,7 +1633,11 @@ def test_pyxis_container_create_uses_the_pull_budget_not_the_command_budget(
 
     create_timeout, command_timeout = timeouts[0], timeouts[1]
     assert 0 < create_timeout <= 3600 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
-    assert 0 < command_timeout <= 300 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
+    assert (
+        0
+        < command_timeout
+        <= 300 + pyxis_environment_mod.SRUN_PYXIS_WORKLOAD_TEARDOWN_GRACE_S
+    )
     assert create_timeout > command_timeout, (
         "container creation must not be bounded by the per-command timeout"
     )
