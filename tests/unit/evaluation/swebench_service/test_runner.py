@@ -26,6 +26,7 @@ from inference_endpoint.evaluation.swebench_service.swebench_service.pyxis_envir
     PyxisEnvironment,
     build_srun_command,
     resolve_image,
+    run_srun_step,
     safe_srun_env,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.runner import (
@@ -763,23 +764,31 @@ def _pyxis_request(instance_ids: list[str] | None = None) -> RunRequest:
 _PYXIS_IMAGE_REGISTRY = "gitlab-master.nvidia.com:5005/hvagadia/swebench-arm64-images"
 
 
-def _finish_srun_step(command: list[str], returncode: int) -> None:
+def _srun_status_mount(command: list[str]) -> tuple[Path, str] | None:
     mount_argument = next(
-        (
-            argument
-            for argument in command
-            if argument.startswith("--container-mounts=")
-        ),
+        (argument for argument in command if argument.startswith("--container-mounts=")),
         None,
     )
     if mount_argument is None:
-        return
+        return None
     for mount in mount_argument.removeprefix("--container-mounts=").split(","):
         source, destination = mount.split(":", 1)
         if destination.startswith("/tmp/.mlperf_srun_status."):
-            Path(source).write_text(f"finished:{returncode}\n")
-            return
-    raise AssertionError("srun command does not mount its status file")
+            return Path(source), destination
+    return None
+
+
+def _required_srun_status_mount(command: list[str]) -> tuple[Path, str]:
+    status_mount = _srun_status_mount(command)
+    assert status_mount is not None, "srun command does not mount its status file"
+    return status_mount
+
+
+def _finish_srun_step(command: list[str], returncode: int) -> None:
+    status_mount = _srun_status_mount(command)
+    if status_mount is None:
+        return
+    status_mount[0].write_text(f"finished:{returncode}\n")
 
 
 def _install_fake_minisweagent(monkeypatch, swebench) -> None:
@@ -907,7 +916,7 @@ def test_pyxis_qwen_command_preserves_inner_deadline_with_outer_grace(
     assert command_timeout_s == 300
     assert pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S == 300
     assert pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S == 300
-    assert calls[1][1]["timeout"] == 600
+    assert 0 < calls[1][1]["timeout"] <= 600
     assert "300" in calls[1][0]
     assert calls[-1][1]["timeout"] == pyxis_environment_mod.PYXIS_CLEANUP_TIMEOUT_S
 
@@ -1282,6 +1291,248 @@ def test_pyxis_environment_raises_when_srun_never_starts_command(monkeypatch, tm
     assert failure_path.exists()
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "mode"),
+    [
+        (167, "Job credential expired", "", "existing_container"),
+        (139, "", "Header lengths are longer than data received", "evaluator"),
+    ],
+)
+def test_pyxis_retries_exact_pending_transient_srun_launch_failure(
+    monkeypatch, tmp_path, returncode, stdout, stderr, mode
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 2:
+            _finish_srun_step(command, 0)
+            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+        assert _required_srun_status_mount(command)[0].read_text() == "pending\n"
+        return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_kwargs = (
+        {"name": "existing-container"}
+        if mode == "existing_container"
+        else {"image": tmp_path / "task.sqsh"}
+    )
+
+    result = run_srun_step(
+        argv=["true"],
+        status_path=Path(pyxis_environment_mod._STEP_STATUS),
+        timeout_s=30,
+        stderr=subprocess.PIPE,
+        **run_kwargs,
+    )
+
+    assert result.returncode == 0
+    assert len(calls) == 2
+    first_mount = _required_srun_status_mount(calls[0])
+    second_mount = _required_srun_status_mount(calls[1])
+    assert first_mount[0] != second_mount[0]
+    assert first_mount[1] != second_mount[1]
+
+
+def test_pyxis_marks_retryable_srun_failure_only_after_retry_exhaustion(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    failure_path = tmp_path / ".pyxis_infrastructure_failure"
+    marker_existed_before_second_attempt: list[bool] = []
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            marker_existed_before_second_attempt.append(failure_path.exists())
+        return subprocess.CompletedProcess(
+            command, 167, stdout="Job credential expired", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RunnerError, match="Job credential expired"):
+        run_srun_step(
+            argv=["true"],
+            status_path=Path(pyxis_environment_mod._STEP_STATUS),
+            timeout_s=30,
+            failure_path=failure_path,
+            image=tmp_path / "task.sqsh",
+        )
+
+    assert calls == 2
+    assert marker_existed_before_second_attempt == [False]
+    assert failure_path.exists()
+
+
+def test_pyxis_retry_uses_only_the_remaining_original_deadline(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    monotonic_times = iter((100.0, 100.0, 130.0))
+    monkeypatch.setattr(pyxis_environment_mod.time, "monotonic", lambda: next(monotonic_times))
+    timeouts: list[float] = []
+
+    def fake_run(command, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        if len(timeouts) == 2:
+            _finish_srun_step(command, 0)
+            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+        return subprocess.CompletedProcess(
+            command, 167, stdout="Job credential expired", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        run_srun_step(
+            argv=["true"],
+            status_path=Path(pyxis_environment_mod._STEP_STATUS),
+            timeout_s=30,
+            image=tmp_path / "task.sqsh",
+        ).returncode
+        == 0
+    )
+    assert timeouts == [330.0, 300.0]
+
+
+def test_pyxis_skips_retry_when_the_original_deadline_is_exhausted(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    monotonic_times = iter((0.0, 0.0, 330.0))
+    monkeypatch.setattr(pyxis_environment_mod.time, "monotonic", lambda: next(monotonic_times))
+    failure_path = tmp_path / ".pyxis_infrastructure_failure"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            command, 167, stdout="Job credential expired", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RunnerError, match=r"exceeded its 330s deadline before retry"):
+        run_srun_step(
+            argv=["true"],
+            status_path=Path(pyxis_environment_mod._STEP_STATUS),
+            timeout_s=30,
+            failure_path=failure_path,
+            image=tmp_path / "task.sqsh",
+        )
+
+    assert calls == 1
+    assert failure_path.exists()
+
+
+def test_pyxis_does_not_retry_unmounted_host_srun(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    failure_path = tmp_path / ".pyxis_infrastructure_failure"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            command, 167, stdout="Job credential expired", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RunnerError, match="before the command completed"):
+        run_srun_step(
+            argv=["true"],
+            status_path=Path(pyxis_environment_mod._STEP_STATUS),
+            timeout_s=30,
+            failure_path=failure_path,
+        )
+
+    assert calls == 1
+    assert failure_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("status", "returncode", "output"),
+    [
+        ("started", 167, "Job credential expired"),
+        ("finished", 167, "Job credential expired"),
+        ("pending", 167, "unrelated launch failure"),
+        ("pending", 1, "Job credential expired"),
+    ],
+)
+def test_pyxis_does_not_retry_nonexact_srun_launch_failures(
+    monkeypatch, tmp_path, status, returncode, output
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    failure_path = tmp_path / ".pyxis_infrastructure_failure"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if status == "finished":
+            _finish_srun_step(command, returncode)
+        elif status == "started":
+            _required_srun_status_mount(command)[0].write_text("started\n")
+        return subprocess.CompletedProcess(command, returncode, stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    step = {
+        "argv": ["true"],
+        "status_path": Path(pyxis_environment_mod._STEP_STATUS),
+        "timeout_s": 30,
+        "failure_path": failure_path,
+        "image": tmp_path / "task.sqsh",
+    }
+
+    if status == "finished":
+        assert run_srun_step(**step).returncode == returncode
+        assert not failure_path.exists()
+    else:
+        with pytest.raises(RunnerError):
+            run_srun_step(**step)
+        assert failure_path.exists()
+    assert calls == 1
+
+
+def test_pyxis_does_not_retry_named_container_creation(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    failure_path = tmp_path / ".pyxis_infrastructure_failure"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            command, 167, stdout="Job credential expired", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RunnerError, match="Job credential expired"):
+        run_srun_step(
+            argv=["true"],
+            status_path=Path(pyxis_environment_mod._STEP_STATUS),
+            timeout_s=30,
+            failure_path=failure_path,
+            image=tmp_path / "task.sqsh",
+            name="new-container",
+        )
+
+    assert calls == 1
+    assert failure_path.exists()
+
+
 def test_pyxis_container_create_uses_the_pull_budget_not_the_command_budget(
     monkeypatch, tmp_path
 ):
@@ -1314,8 +1565,8 @@ def test_pyxis_container_create_uses_the_pull_budget_not_the_command_budget(
     environment.execute({"command": "pytest -q"})
 
     create_timeout, command_timeout = timeouts[0], timeouts[1]
-    assert create_timeout == 3600 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
-    assert command_timeout == 300 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
+    assert 0 < create_timeout <= 3600 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
+    assert 0 < command_timeout <= 300 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
     assert create_timeout > command_timeout, (
         "container creation must not be bounded by the per-command timeout"
     )
@@ -1340,10 +1591,7 @@ def test_pyxis_container_create_budget_defaults_without_a_template_value(
         image=tmp_path / "task.sqsh", run_id="run-1", timeout=300
     )
 
-    assert (
-        timeouts[0]
-        == 3600 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
-    )
+    assert 0 < timeouts[0] <= 3600 + pyxis_environment_mod.SRUN_TEARDOWN_GRACE_S
     environment.cleanup()
 
 

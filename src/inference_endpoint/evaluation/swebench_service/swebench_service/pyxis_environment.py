@@ -136,61 +136,85 @@ def run_srun_step(
     # The workload must not share a predictable status file with the host. A
     # test that removes or rewrites that file would otherwise look exactly like
     # an srun/Pyxis failure. Mount a fresh host-only file at a per-step path.
-    with tempfile.TemporaryDirectory(prefix="mlperf_srun_status_") as status_tmp:
-        host_status_path = Path(status_tmp) / status_path.name
-        host_status_path.write_text("pending\n")
-        host_status_path.chmod(0o666)
-        container_status_path = f"/tmp/{status_path.name}.{uuid.uuid4().hex}"
-        step_mounts = [*(mounts or []), (host_status_path, container_status_path)]
-        command = build_srun_command(
-            image=image,
-            name=name,
-            mounts=step_mounts,
-            workdir=workdir,
-            argv=[
-                "bash",
-                "-c",
-                _STEP_SCRIPT,
-                "pyxis-step",
-                container_status_path,
-                str(timeout_s),
-                *argv,
-            ],
-        )
-        try:
-            result = subprocess.run(
-                command,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                timeout=timeout_s + SRUN_TEARDOWN_GRACE_S,
-                env=safe_srun_env(),
+    total_timeout_s = timeout_s + SRUN_TEARDOWN_GRACE_S
+    deadline = time.monotonic() + total_timeout_s
+    for attempt in range(2):
+        with tempfile.TemporaryDirectory(prefix="mlperf_srun_status_") as status_tmp:
+            host_status_path = Path(status_tmp) / status_path.name
+            host_status_path.write_text("pending\n")
+            host_status_path.chmod(0o666)
+            container_status_path = f"/tmp/{status_path.name}.{uuid.uuid4().hex}"
+            step_mounts = [*(mounts or []), (host_status_path, container_status_path)]
+            command = build_srun_command(
+                image=image,
+                name=name,
+                mounts=step_mounts,
+                workdir=workdir,
+                argv=[
+                    "bash",
+                    "-c",
+                    _STEP_SCRIPT,
+                    "pyxis-step",
+                    container_status_path,
+                    str(timeout_s),
+                    *argv,
+                ],
             )
-        except subprocess.TimeoutExpired as exc:
-            if failure_path is not None:
-                failure_path.touch()
-            raise RunnerError(
-                f"Pyxis step exceeded its "
-                f"{timeout_s + SRUN_TEARDOWN_GRACE_S}s deadline and was killed"
-                + _srun_evidence(exc.output)
-            ) from exc
-        except (OSError, subprocess.SubprocessError) as exc:
-            if failure_path is not None:
-                failure_path.touch()
-            raise RunnerError(
-                "Pyxis infrastructure failure before the command completed: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-        if host_status_path.read_text().strip() != f"finished:{result.returncode}":
-            if failure_path is not None:
-                failure_path.touch()
-            raise RunnerError(
-                "Pyxis infrastructure failure before the command completed "
-                f"(srun exited {result.returncode})" + _srun_evidence(result.stdout)
-            )
-        return result
+            try:
+                remaining_timeout_s = deadline - time.monotonic()
+                if remaining_timeout_s <= 0:
+                    if failure_path is not None:
+                        failure_path.touch()
+                    raise RunnerError(
+                        f"Pyxis step exceeded its {total_timeout_s}s deadline "
+                        "before retry could start"
+                    )
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    timeout=remaining_timeout_s,
+                    env=safe_srun_env(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                if failure_path is not None:
+                    failure_path.touch()
+                raise RunnerError(
+                    f"Pyxis step exceeded its "
+                    f"{total_timeout_s}s deadline and was killed"
+                    + _srun_evidence(exc.output)
+                ) from exc
+            except (OSError, subprocess.SubprocessError) as exc:
+                if failure_path is not None:
+                    failure_path.touch()
+                raise RunnerError(
+                    "Pyxis infrastructure failure before the command completed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+            status = host_status_path.read_text()
+            output = _combined_srun_output(result)
+            if (
+                attempt == 0
+                and (image is not None or name is not None)
+                and not (image is not None and name is not None)
+                and status == "pending\n"
+                and _is_retryable_srun_launch_failure(result.returncode, output)
+            ):
+                continue
+            if status.strip() != f"finished:{result.returncode}":
+                if failure_path is not None:
+                    failure_path.touch()
+                raise RunnerError(
+                    "Pyxis infrastructure failure before the command completed "
+                    f"(srun exited {result.returncode})" + _srun_evidence(output)
+                )
+            return result
+
+    raise AssertionError("unreachable")
 
 
 #: Opt-in JSONL sink for container-create durations. Off unless set, so this
@@ -241,6 +265,19 @@ def _srun_evidence(output: str | bytes | None, limit: int = 2000) -> str:
     if len(text) > limit:
         text = "..." + text[-limit:]
     return f"\n--- srun output ---\n{text}"
+
+
+def _combined_srun_output(result: subprocess.CompletedProcess[str]) -> str:
+    streams = (result.stdout, result.stderr)
+    return "\n".join(
+        stream for stream in streams if stream
+    )
+
+
+def _is_retryable_srun_launch_failure(returncode: int, output: str) -> bool:
+    return (returncode == 167 and "Job credential expired" in output) or (
+        returncode == 139 and "Header lengths are longer than data received" in output
+    )
 
 
 def resolve_image(image_registry: str, instance_id: str) -> str:
