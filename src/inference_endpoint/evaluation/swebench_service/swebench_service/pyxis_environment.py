@@ -13,10 +13,13 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .runner import RunnerError
 
@@ -31,6 +34,8 @@ _SAFE_SRUN_ENV = (
     "LC_ALL",
     "TMPDIR",
     "XDG_RUNTIME_DIR",
+    "ENROOT_TEMP_PATH",
+    "ENROOT_CONFIG_PATH",
     # Proxy policy must reach enroot, which performs the registry pull inside
     # the step. Clusters that pin a container-cache proxy system-wide 403 any
     # registry outside its allow-list, and without no_proxy every per-instance
@@ -51,6 +56,8 @@ _SAFE_SRUN_ENV = (
     "SLURM_CONF",
 )
 _STEP_STATUS = "/tmp/.mlperf_srun_status"
+_SRUN_STEP_ATTEMPTS = 10
+_SRUN_LAUNCH_RETRY_DELAY_S = 1
 _STEP_SCRIPT = r"""set +e
 status_path=$1
 timeout_s=$2
@@ -61,6 +68,63 @@ returncode=$?
 printf 'finished:%s\n' "$returncode" > "$status_path"
 exit "$returncode"
 """
+
+
+@dataclass
+class PyxisStepLimits:
+    """Process-local limits for Pyxis container creation and nested srun steps."""
+
+    max_concurrent_creates: int | None = None
+    max_concurrent_srun_steps: int | None = None
+    launch_grace_s: int = 30
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_concurrent_creates", self.max_concurrent_creates),
+            ("max_concurrent_srun_steps", self.max_concurrent_srun_steps),
+        ):
+            if value is not None and value < 1:
+                raise RunnerError(f"{name} must be positive when set")
+        if self.launch_grace_s < 0:
+            raise RunnerError("launch_grace_s must not be negative")
+        self._creates = (
+            threading.BoundedSemaphore(self.max_concurrent_creates)
+            if self.max_concurrent_creates is not None
+            else None
+        )
+        self._steps = (
+            threading.BoundedSemaphore(self.max_concurrent_srun_steps)
+            if self.max_concurrent_srun_steps is not None
+            else None
+        )
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        # mini-swe-agent copies environment configuration before construction.
+        # This limiter is intentionally shared by every environment in this process.
+        memo[id(self)] = self
+        return self
+
+    @contextmanager
+    def admit(self, *, create: bool, deadline: float) -> Iterator[None]:
+        acquired: list[threading.BoundedSemaphore] = []
+        try:
+            for semaphore in (self._creates if create else None, self._steps):
+                if semaphore is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not semaphore.acquire(timeout=remaining):
+                        raise PyxisAdmissionTimeout(
+                            "Pyxis step did not acquire its concurrency slot before "
+                            "the outer deadline"
+                        )
+                    acquired.append(semaphore)
+            yield
+        finally:
+            for semaphore in reversed(acquired):
+                semaphore.release()
+
+
+class PyxisAdmissionTimeout(RunnerError):
+    pass
 
 
 def safe_srun_env() -> dict[str, str]:
@@ -74,11 +138,12 @@ def build_srun_command(
     name: str | None = None,
     mounts: list[tuple[Path, str]] | None = None,
     workdir: str | None = None,
+    node: str | None = None,
 ) -> list[str]:
     job_id = os.environ.get("SLURM_JOB_ID", "").strip()
     if not job_id:
         raise RunnerError("Pyxis runtime requires SLURM_JOB_ID")
-    node = os.environ.get("SLURMD_NODENAME", "").strip()
+    node = node or os.environ.get("SLURMD_NODENAME", "").strip()
     if not node:
         raise RunnerError("Pyxis runtime requires SLURMD_NODENAME")
     command = [
@@ -127,14 +192,16 @@ def run_srun_step(
     mounts: list[tuple[Path, str]] | None = None,
     workdir: str | None = None,
     stderr: int = subprocess.STDOUT,
+    node: str | None = None,
+    step_limits: PyxisStepLimits | None = None,
+    create: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    status_path.write_text("pending\n")
-    status_path.chmod(0o666)
     command = build_srun_command(
         image=image,
         name=name,
         mounts=mounts,
         workdir=workdir,
+        node=node,
         argv=[
             "bash",
             "-c",
@@ -145,23 +212,71 @@ def run_srun_step(
             *argv,
         ],
     )
+    outer_timeout_s = timeout_s + (step_limits.launch_grace_s if step_limits else 30)
+    deadline = time.monotonic() + outer_timeout_s
     try:
-        result = subprocess.run(
-            command,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            timeout=timeout_s + 30,
-            env=safe_srun_env(),
+        admission = (
+            step_limits.admit(create=create, deadline=deadline)
+            if step_limits
+            else nullcontext()
         )
+        with admission:
+            for attempt in range(_SRUN_STEP_ATTEMPTS):
+                # The host writes pending before each launch.  The step writes
+                # started before it executes the requested command.  A failed
+                # srun may be retried only when it returned with pending still
+                # present, so the requested command cannot run twice.
+                status_path.write_text("pending\n")
+                status_path.chmod(0o666)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PyxisAdmissionTimeout(
+                        "Pyxis step did not start before the outer deadline"
+                    )
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    timeout=remaining,
+                    env=safe_srun_env(),
+                )
+                status = status_path.read_text().strip()
+                if status == f"finished:{result.returncode}":
+                    return result
+                # Pyxis can create a container before the step script starts,
+                # so container creation is never replayed.
+                if (
+                    attempt + 1 < _SRUN_STEP_ATTEMPTS
+                    and not create
+                    and result.returncode != 0
+                    and status == "pending"
+                    and time.monotonic() + _SRUN_LAUNCH_RETRY_DELAY_S < deadline
+                ):
+                    logger.warning(
+                        "srun ended before the Pyxis step started; retrying "
+                        "launch %d of %d",
+                        attempt + 2,
+                        _SRUN_STEP_ATTEMPTS,
+                    )
+                    time.sleep(_SRUN_LAUNCH_RETRY_DELAY_S)
+                    continue
+                break
+    except PyxisAdmissionTimeout as exc:
+        if failure_path is not None:
+            failure_path.touch()
+        raise RunnerError(
+            f"Pyxis infrastructure failure: {exc} ({outer_timeout_s}s total budget)"
+        ) from exc
     except subprocess.TimeoutExpired as exc:
         if failure_path is not None:
             failure_path.touch()
         raise RunnerError(
-            f"Pyxis step exceeded its {timeout_s + 30}s deadline and was killed"
-            + _srun_evidence(exc.output)
+            "Pyxis step exceeded its "
+            f"{outer_timeout_s}s "
+            "deadline and was killed" + _srun_evidence(exc.output)
         ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         if failure_path is not None:
@@ -248,8 +363,12 @@ def resolve_image(image_registry: str, instance_id: str) -> str:
 
 
 class PyxisEnvironmentConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     image: str | Path
     run_id: str
+    node: str | None = None
+    shared_runtime_root: Path | None = None
     cwd: str = "/testbed"
     env: dict[str, str] = Field(default_factory=dict)
     timeout_s: int = Field(
@@ -272,6 +391,7 @@ class PyxisEnvironmentConfig(BaseModel):
     )
     interpreter: list[str] = Field(default_factory=lambda: ["bash", "-c"])
     infrastructure_failure_path: Path | None = None
+    step_limits: PyxisStepLimits | None = Field(default=None, exclude=True)
 
 
 class PyxisEnvironment:
@@ -279,7 +399,14 @@ class PyxisEnvironment:
         self.config = PyxisEnvironmentConfig(**kwargs)
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", self.config.run_id)[:24]
         self.name = f"mswe_{safe_run_id}_{uuid.uuid4().hex[:8]}"
-        self._tmp = tempfile.TemporaryDirectory(prefix=f"pyxis_{self.name}_")
+        if self.config.shared_runtime_root is not None:
+            temp_root = self.config.shared_runtime_root / "pyxis-runtime"
+            temp_root.mkdir(parents=True, exist_ok=True)
+        else:
+            temp_root = None
+        self._tmp = tempfile.TemporaryDirectory(
+            prefix=f"pyxis_{self.name}_", dir=temp_root
+        )
         self._tmp_dir = Path(self._tmp.name)
         self._tmp_dir.chmod(0o1777)
         self._lock = threading.Lock()
@@ -296,6 +423,9 @@ class PyxisEnvironment:
                 status_path=self._tmp_dir / Path(_STEP_STATUS).name,
                 timeout_s=self.config.create_timeout_s,
                 failure_path=self.config.infrastructure_failure_path,
+                node=getattr(self.config, "node", None),
+                step_limits=getattr(self.config, "step_limits", None),
+                create=True,
             )
         except RunnerError as exc:
             _record_create_timing(
@@ -323,6 +453,8 @@ class PyxisEnvironment:
             name=self.name,
             mounts=[(self._tmp_dir, "/tmp")],
             workdir=cwd or self.config.cwd,
+            node=getattr(self.config, "node", None),
+            step_limits=getattr(self.config, "step_limits", None),
         )
         output: dict[str, Any]
         if result.returncode == 124:
@@ -400,7 +532,8 @@ class PyxisEnvironment:
                 try:
                     subprocess.run(
                         build_srun_command(
-                            argv=["enroot", "remove", "-f", f"pyxis_{self.name}"]
+                            argv=["enroot", "remove", "-f", f"pyxis_{self.name}"],
+                            node=getattr(self.config, "node", None),
                         ),
                         check=False,
                         capture_output=True,

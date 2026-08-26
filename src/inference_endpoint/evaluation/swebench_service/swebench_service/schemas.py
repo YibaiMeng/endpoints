@@ -47,6 +47,10 @@ class RunRequest(BaseModel):
     max_eval_workers: int = Field(ge=1)
     evaluated_instance_ids: list[str] = Field(min_length=1)
     template: TemplateName = "default"
+    agent_command_timeout_s: int | None = Field(default=None, ge=1)
+    agent_create_timeout_s: int | None = Field(default=None, ge=1)
+    model_request_timeout_s: int | None = Field(default=None, ge=1)
+    eval_timeout_s: int | None = Field(default=None, ge=1)
 
     @field_validator("endpoint_urls")
     @classmethod

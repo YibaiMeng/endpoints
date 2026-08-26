@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+
 from inference_endpoint.evaluation.swebench_service.swebench_service import (
     server as server_mod,
 )
@@ -252,6 +253,30 @@ def test_service_requires_auth_or_explicit_development_override(tmp_path):
         create_app(ServiceConfig(artifact_root=tmp_path), runner=FakeRunner())
 
 
+def test_create_app_preserves_pyxis_placement_configuration(tmp_path):
+    placement_file = tmp_path / "placement.tsv"
+    shared_root = tmp_path / "shared"
+    app = create_app(
+        ServiceConfig(
+            artifact_root=tmp_path / "artifacts",
+            allow_unauthenticated=True,
+            pyxis_placement_file=placement_file,
+            pyxis_shared_runtime_root=shared_root,
+            pyxis_max_concurrent_creates=2,
+            pyxis_max_concurrent_srun_steps=4,
+            pyxis_srun_launch_grace_s=45,
+        ),
+        runner=FakeRunner(),
+    )
+
+    config = app[MANAGER_KEY].config
+    assert config.pyxis_placement_file == placement_file
+    assert config.pyxis_shared_runtime_root == shared_root
+    assert config.pyxis_max_concurrent_creates == 2
+    assert config.pyxis_max_concurrent_srun_steps == 4
+    assert config.pyxis_srun_launch_grace_s == 45
+
+
 @pytest.mark.asyncio
 async def test_runner_transitions_to_succeeded(tmp_path):
     runner = FakeRunner()
@@ -275,6 +300,80 @@ async def test_runner_transitions_to_succeeded(tmp_path):
     assert status["phase"] == "succeeded"
     assert status["agent_completed"] == 1
     assert status["eval_completed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_lists_retained_failure_artifacts(tmp_path):
+    class ArtifactRunner(FakeRunner):
+        def run(self, request, run_dir: Path, cancel_token=None):
+            (run_dir / "agent_phase_error.txt").write_text("agent failed")
+            (run_dir / "eval_infrastructure_failures.json").write_text("{}\n")
+            return super().run(request, run_dir, cancel_token=cancel_token)
+
+    client = await _client(tmp_path, ArtifactRunner())
+    try:
+        submit = await client.post("/v1/runs", json=_payload())
+        run_id = (await submit.json())["run_id"]
+        for _ in range(20):
+            response = await client.get(f"/v1/runs/{run_id}")
+            status = await response.json()
+            if status["status"] == "succeeded":
+                break
+            await asyncio.sleep(0.01)
+        agent_response = await client.get(
+            f"/v1/runs/{run_id}/artifacts/agent_phase_error.txt"
+        )
+        eval_response = await client.get(
+            f"/v1/runs/{run_id}/artifacts/eval_infrastructure_failures.json"
+        )
+    finally:
+        await client.close()
+
+    assert agent_response.status == 200
+    assert eval_response.status == 200
+    assert {
+        artifact["name"] for artifact in status["artifacts"]
+    } >= {"agent_phase_error.txt", "eval_infrastructure_failures.json"}
+
+
+@pytest.mark.asyncio
+async def test_failed_status_lists_partial_artifacts(tmp_path):
+    class PartialArtifactRunner(FakeRunner):
+        def run(self, request, run_dir: Path, cancel_token=None):
+            (run_dir / "agent_phase_error.txt").write_text("agent failed")
+            (run_dir / "eval_infrastructure_failures.json").write_text("{}\n")
+            (run_dir / "preds.json").write_text("{}")
+            (run_dir / "swe_bench_results.json").write_text("{}")
+            raise RuntimeError("report failed")
+
+    client = await _client(tmp_path, PartialArtifactRunner())
+    try:
+        submit = await client.post("/v1/runs", json=_payload())
+        run_id = (await submit.json())["run_id"]
+        for _ in range(20):
+            response = await client.get(f"/v1/runs/{run_id}")
+            status = await response.json()
+            if status["status"] == "failed":
+                break
+            await asyncio.sleep(0.01)
+        agent_response = await client.get(
+            f"/v1/runs/{run_id}/artifacts/agent_phase_error.txt"
+        )
+        eval_response = await client.get(
+            f"/v1/runs/{run_id}/artifacts/eval_infrastructure_failures.json"
+        )
+    finally:
+        await client.close()
+
+    assert status["status"] == "failed"
+    assert agent_response.status == 200
+    assert eval_response.status == 200
+    assert {artifact["name"] for artifact in status["artifacts"]} >= {
+        "agent_phase_error.txt",
+        "eval_infrastructure_failures.json",
+        "preds.json",
+        "swe_bench_results.json",
+    }
 
 
 @pytest.mark.asyncio

@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import atomic_write_bytes
-from .pyxis_environment import resolve_image, run_srun_step
-from .runner import RunnerError
+from .pyxis_environment import PyxisStepLimits, resolve_image, run_srun_step
+from .runner import RunnerError, load_pyxis_placement
 
 _PRINT_LOCK = threading.Lock()
 _INFRASTRUCTURE_FAILURE = ".pyxis_infrastructure_failure"
@@ -53,6 +53,20 @@ exit 0
 """
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
+
+
 def _run_agent(args: argparse.Namespace) -> None:
     # Generation-only dependencies are loaded only in the agent worker mode.
     from minisweagent.environments import get_environment
@@ -66,7 +80,13 @@ def _run_agent(args: argparse.Namespace) -> None:
         environment_config["image"] = resolve_image(
             args.image_registry, instance["instance_id"]
         )
+        if args.placement is not None:
+            environment_config["node"] = args.placement.node_for(
+                instance["instance_id"]
+            )
+            environment_config["shared_runtime_root"] = str(args.shared_runtime_root)
         environment_config["infrastructure_failure_path"] = str(failure_path)
+        environment_config["step_limits"] = args.step_limits
         return get_environment(environment_config)
 
     if not hasattr(swebench, "get_sb_environment"):
@@ -104,6 +124,8 @@ def _evaluate_instance(
     output_dir: Path,
     run_id: str,
     timeout_s: int,
+    node: str | None = None,
+    step_limits: PyxisStepLimits | None = None,
 ) -> None:
     instance_id = test_spec.instance_id
     safe_model = prediction["model_name_or_path"].replace("/", "__")
@@ -127,6 +149,7 @@ def _evaluate_instance(
     mounts.append((status_path, "/tmp/.mlperf_srun_status"))
     result = run_srun_step(
         image=image,
+        create=True,
         mounts=mounts,
         workdir="/testbed",
         status_path=status_path,
@@ -142,6 +165,8 @@ def _evaluate_instance(
             "/tmp/swebench_test_output.txt",
             str(timeout_s),
         ],
+        node=node,
+        step_limits=step_limits,
     )
     with _PRINT_LOCK:
         print(f"[{instance_id}]\n{result.stdout}{result.stderr}", flush=True)
@@ -200,9 +225,16 @@ def _run_eval(args: argparse.Namespace) -> None:
                 "output_dir": args.output_dir,
                 "run_id": args.run_id,
                 "timeout_s": args.timeout,
+                "node": (
+                    args.placement.node_for(instance_id)
+                    if args.placement is not None
+                    else None
+                ),
+                "step_limits": args.step_limits,
             }
         )
 
+    output_dir = args.output_dir.resolve()
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=args.max_workers
     ) as executor:
@@ -219,14 +251,28 @@ def _run_eval(args: argparse.Namespace) -> None:
             except Exception as exc:
                 with _PRINT_LOCK:
                     print(f"Pyxis evaluation failed: {exc}", flush=True)
-                failures.append(futures[future])
+                failures.append(
+                    {
+                        "instance_id": futures[future],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
         if failures:
-            raise RunnerError(
-                "Pyxis infrastructure failure evaluating: "
-                + ", ".join(sorted(failures))
+            atomic_write_bytes(
+                output_dir / "eval_infrastructure_failures.json",
+                (
+                    json.dumps(
+                        {
+                            "failures": sorted(
+                                failures, key=lambda item: item["instance_id"]
+                            )
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode(),
             )
 
-    output_dir = args.output_dir.resolve()
     with contextlib.chdir(output_dir):
         make_run_report(
             predictions,
@@ -240,6 +286,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
 
+    def add_step_limit_arguments(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--max-concurrent-creates", type=_positive_int)
+        command_parser.add_argument("--max-concurrent-srun-steps", type=_positive_int)
+        command_parser.add_argument(
+            "--srun-launch-grace-s", type=_nonnegative_int, default=30
+        )
+
     agent_parser = commands.add_parser("agent")
     agent_parser.add_argument("--model", required=True)
     agent_parser.add_argument("--config", type=Path, required=True)
@@ -249,6 +302,9 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument("--workers", type=int, required=True)
     agent_parser.add_argument("--output", type=Path, required=True)
     agent_parser.add_argument("--image-registry", required=True)
+    agent_parser.add_argument("--placement-file", type=Path)
+    agent_parser.add_argument("--shared-runtime-root", type=Path)
+    add_step_limit_arguments(agent_parser)
 
     eval_parser = commands.add_parser("eval")
     eval_parser.add_argument("--dataset-name", required=True)
@@ -260,7 +316,37 @@ def main(argv: list[str] | None = None) -> None:
     eval_parser.add_argument("--output-dir", type=Path, required=True)
     eval_parser.add_argument("--timeout", type=int, default=1800)
     eval_parser.add_argument("--instance-ids", nargs="+", required=True)
+    eval_parser.add_argument("--placement-file", type=Path)
+    eval_parser.add_argument("--shared-runtime-root", type=Path)
+    add_step_limit_arguments(eval_parser)
     args = parser.parse_args(argv)
+
+    if (args.placement_file is None) != (args.shared_runtime_root is None):
+        parser.error("--placement-file and --shared-runtime-root must be used together")
+    if args.shared_runtime_root is not None:
+        if not args.shared_runtime_root.is_absolute():
+            parser.error("--shared-runtime-root must be absolute")
+        args.shared_runtime_root = args.shared_runtime_root.resolve()
+        artifact_path = (
+            args.output if args.command == "agent" else args.output_dir
+        ).resolve()
+        try:
+            artifact_path.relative_to(args.shared_runtime_root)
+        except ValueError:
+            parser.error(
+                "Pyxis placement requires agent and evaluation artifacts under "
+                "--shared-runtime-root"
+            )
+    args.placement = (
+        load_pyxis_placement(args.placement_file)
+        if args.placement_file is not None
+        else None
+    )
+    args.step_limits = PyxisStepLimits(
+        max_concurrent_creates=args.max_concurrent_creates,
+        max_concurrent_srun_steps=args.max_concurrent_srun_steps,
+        launch_grace_s=args.srun_launch_grace_s,
+    )
 
     if args.command == "agent":
         _run_agent(args)
