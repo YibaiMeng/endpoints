@@ -56,6 +56,8 @@ _SAFE_SRUN_ENV = (
     "SLURM_CONF",
 )
 _STEP_STATUS = "/tmp/.mlperf_srun_status"
+_SRUN_STEP_ATTEMPTS = 3
+_SRUN_LAUNCH_RETRY_DELAY_S = 1
 _STEP_SCRIPT = r"""set +e
 status_path=$1
 timeout_s=$2
@@ -194,8 +196,6 @@ def run_srun_step(
     step_limits: PyxisStepLimits | None = None,
     create: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    status_path.write_text("pending\n")
-    status_path.chmod(0o666)
     command = build_srun_command(
         image=image,
         name=name,
@@ -221,21 +221,49 @@ def run_srun_step(
             else nullcontext()
         )
         with admission:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise PyxisAdmissionTimeout(
-                    "Pyxis step did not start before the outer deadline"
+            for attempt in range(_SRUN_STEP_ATTEMPTS):
+                # The host writes pending before each launch.  The step writes
+                # started before it executes the requested command.  A failed
+                # srun may be retried only when it returned with pending still
+                # present, so the requested command cannot run twice.
+                status_path.write_text("pending\n")
+                status_path.chmod(0o666)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PyxisAdmissionTimeout(
+                        "Pyxis step did not start before the outer deadline"
+                    )
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    timeout=remaining,
+                    env=safe_srun_env(),
                 )
-            result = subprocess.run(
-                command,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                timeout=remaining,
-                env=safe_srun_env(),
-            )
+                status = status_path.read_text().strip()
+                if status == f"finished:{result.returncode}":
+                    return result
+                # Pyxis can create a container before the step script starts,
+                # so container creation is never replayed.
+                if (
+                    attempt + 1 < _SRUN_STEP_ATTEMPTS
+                    and not create
+                    and result.returncode != 0
+                    and status == "pending"
+                    and time.monotonic() + _SRUN_LAUNCH_RETRY_DELAY_S < deadline
+                ):
+                    logger.warning(
+                        "srun ended before the Pyxis step started; retrying "
+                        "launch %d of %d",
+                        attempt + 2,
+                        _SRUN_STEP_ATTEMPTS,
+                    )
+                    time.sleep(_SRUN_LAUNCH_RETRY_DELAY_S)
+                    continue
+                break
     except PyxisAdmissionTimeout as exc:
         if failure_path is not None:
             failure_path.touch()

@@ -1002,6 +1002,109 @@ def test_pyxis_admission_timeout_marks_infrastructure_failure(monkeypatch, tmp_p
     assert failure_path.exists()
 
 
+def test_pyxis_retries_srun_launch_that_never_starts(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "worker-a")
+    status_path = tmp_path / "status"
+    failure_path = tmp_path / "failure"
+    limits = PyxisStepLimits()
+    calls = 0
+    admissions = 0
+
+    def fake_admit(*, create, deadline):
+        nonlocal admissions
+        admissions += 1
+        assert create is False
+
+        class Admission:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *args):
+                return None
+
+        return Admission()
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            status_path.write_text("finished:0\n")
+        return subprocess.CompletedProcess(command, 139 if calls == 1 else 0, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(limits, "admit", fake_admit)
+    monkeypatch.setattr(pyxis_environment_mod.time, "sleep", lambda _: None)
+
+    result = run_srun_step(
+        argv=["true"],
+        status_path=status_path,
+        timeout_s=10,
+        failure_path=failure_path,
+        step_limits=limits,
+    )
+
+    assert result.returncode == 0
+    assert calls == 2
+    assert admissions == 1
+    assert not failure_path.exists()
+
+
+def test_pyxis_does_not_retry_srun_launch_after_step_starts(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "worker-a")
+    status_path = tmp_path / "status"
+    failure_path = tmp_path / "failure"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        status_path.write_text("started\n")
+        return subprocess.CompletedProcess(command, 139, stdout="srun exited\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RunnerError, match=r"srun exited 139"):
+        run_srun_step(
+            argv=["true"],
+            status_path=status_path,
+            timeout_s=10,
+            failure_path=failure_path,
+        )
+
+    assert calls == 1
+    assert failure_path.exists()
+
+
+def test_pyxis_does_not_retry_container_creation(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "worker-a")
+    status_path = tmp_path / "status"
+    failure_path = tmp_path / "failure"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(command, 139, stdout="srun exited\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RunnerError, match=r"srun exited 139"):
+        run_srun_step(
+            argv=["true"],
+            status_path=status_path,
+            timeout_s=10,
+            failure_path=failure_path,
+            image=tmp_path / "task.sqsh",
+            create=True,
+        )
+
+    assert calls == 1
+    assert failure_path.exists()
+
+
 def test_pyxis_environment_reuses_named_writable_container(
     monkeypatch, tmp_path, caplog
 ):
