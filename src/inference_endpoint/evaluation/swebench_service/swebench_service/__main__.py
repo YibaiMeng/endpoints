@@ -34,6 +34,16 @@ def main() -> None:
     parser.add_argument("--subprocess-timeout-s", type=int, default=24 * 60 * 60)
     parser.add_argument("--runtime", choices=("docker", "pyxis"), default="docker")
     parser.add_argument("--image-registry")
+    parser.add_argument(
+        "--pyxis-placement-file",
+        type=Path,
+        help="trusted TSV mapping each requested SWE-bench instance ID to a Slurm node",
+    )
+    parser.add_argument(
+        "--pyxis-shared-runtime-root",
+        type=Path,
+        help="absolute shared filesystem root for multi-node Pyxis artifacts",
+    )
     auth_group = parser.add_mutually_exclusive_group()
     auth_group.add_argument("--auth-token")
     auth_group.add_argument("--allow-unauthenticated", action="store_true")
@@ -49,12 +59,16 @@ def main() -> None:
         auth_token=args.auth_token,
         allow_unauthenticated=args.allow_unauthenticated,
         max_stored_runs=args.max_stored_runs,
+        pyxis_placement_file=args.pyxis_placement_file,
+        pyxis_shared_runtime_root=args.pyxis_shared_runtime_root,
     )
     runner = create_runner(
         args.runtime,
         project_root=Path(__file__).resolve().parents[1],
         subprocess_timeout_s=config.subprocess_timeout_s,
         image_registry=args.image_registry,
+        pyxis_placement_file=config.pyxis_placement_file,
+        pyxis_shared_runtime_root=config.pyxis_shared_runtime_root,
     )
     web.run_app(create_app(config, runner=runner), host=config.host, port=config.port)
 

@@ -70,6 +70,24 @@ unresolved task; an `srun`, Enroot, or container-start failure is an infrastruct
 error that fails the run. The service then aggregates the per-instance reports and
 removes its named Pyxis containers.
 
+### Multi-node Pyxis
+
+For a multi-node allocation, provide a trusted tab-separated placement file and a
+shared filesystem root:
+
+```bash
+--pyxis-placement-file "$RUN_DIR/placement.tsv" \
+--pyxis-shared-runtime-root "$RUN_DIR"
+```
+
+`placement.tsv` contains exactly one `instance_id<TAB>node` row for every requested
+instance. The service checks that the rows match the request exactly, writes a
+read-only copy into each run directory, and uses that copy for both generation and
+evaluation. The service artifact root must be below the shared runtime root so the
+files mounted by remote Pyxis steps are visible on their assigned nodes. Container
+cleanup runs on every node named in the placement file. Temporary container state
+is created below `$RUN_DIR/pyxis-runtime`.
+
 The benchmark client submits a run to this service only in `ACC` or `BOTH`
 mode; the default `PERF` mode skips external evaluation.
 

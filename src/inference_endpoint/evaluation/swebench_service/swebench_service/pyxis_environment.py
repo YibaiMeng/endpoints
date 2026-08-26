@@ -74,11 +74,12 @@ def build_srun_command(
     name: str | None = None,
     mounts: list[tuple[Path, str]] | None = None,
     workdir: str | None = None,
+    node: str | None = None,
 ) -> list[str]:
     job_id = os.environ.get("SLURM_JOB_ID", "").strip()
     if not job_id:
         raise RunnerError("Pyxis runtime requires SLURM_JOB_ID")
-    node = os.environ.get("SLURMD_NODENAME", "").strip()
+    node = node or os.environ.get("SLURMD_NODENAME", "").strip()
     if not node:
         raise RunnerError("Pyxis runtime requires SLURMD_NODENAME")
     command = [
@@ -127,6 +128,7 @@ def run_srun_step(
     mounts: list[tuple[Path, str]] | None = None,
     workdir: str | None = None,
     stderr: int = subprocess.STDOUT,
+    node: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     status_path.write_text("pending\n")
     status_path.chmod(0o666)
@@ -135,6 +137,7 @@ def run_srun_step(
         name=name,
         mounts=mounts,
         workdir=workdir,
+        node=node,
         argv=[
             "bash",
             "-c",
@@ -250,6 +253,8 @@ def resolve_image(image_registry: str, instance_id: str) -> str:
 class PyxisEnvironmentConfig(BaseModel):
     image: str | Path
     run_id: str
+    node: str | None = None
+    shared_runtime_root: Path | None = None
     cwd: str = "/testbed"
     env: dict[str, str] = Field(default_factory=dict)
     timeout_s: int = Field(
@@ -279,7 +284,14 @@ class PyxisEnvironment:
         self.config = PyxisEnvironmentConfig(**kwargs)
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", self.config.run_id)[:24]
         self.name = f"mswe_{safe_run_id}_{uuid.uuid4().hex[:8]}"
-        self._tmp = tempfile.TemporaryDirectory(prefix=f"pyxis_{self.name}_")
+        if self.config.shared_runtime_root is not None:
+            temp_root = self.config.shared_runtime_root / "pyxis-runtime"
+            temp_root.mkdir(parents=True, exist_ok=True)
+        else:
+            temp_root = None
+        self._tmp = tempfile.TemporaryDirectory(
+            prefix=f"pyxis_{self.name}_", dir=temp_root
+        )
         self._tmp_dir = Path(self._tmp.name)
         self._tmp_dir.chmod(0o1777)
         self._lock = threading.Lock()
@@ -296,6 +308,7 @@ class PyxisEnvironment:
                 status_path=self._tmp_dir / Path(_STEP_STATUS).name,
                 timeout_s=self.config.create_timeout_s,
                 failure_path=self.config.infrastructure_failure_path,
+                node=getattr(self.config, "node", None),
             )
         except RunnerError as exc:
             _record_create_timing(
@@ -323,6 +336,7 @@ class PyxisEnvironment:
             name=self.name,
             mounts=[(self._tmp_dir, "/tmp")],
             workdir=cwd or self.config.cwd,
+            node=getattr(self.config, "node", None),
         )
         output: dict[str, Any]
         if result.returncode == 124:
@@ -400,7 +414,8 @@ class PyxisEnvironment:
                 try:
                     subprocess.run(
                         build_srun_command(
-                            argv=["enroot", "remove", "-f", f"pyxis_{self.name}"]
+                            argv=["enroot", "remove", "-f", f"pyxis_{self.name}"],
+                            node=getattr(self.config, "node", None),
                         ),
                         check=False,
                         capture_output=True,

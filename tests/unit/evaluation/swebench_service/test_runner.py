@@ -33,6 +33,7 @@ from inference_endpoint.evaluation.swebench_service.swebench_service.runner impo
     RunnerError,
     SweBenchRunner,
     create_runner,
+    load_pyxis_placement,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.schemas import (
     RunRequest,
@@ -779,6 +780,15 @@ def test_pyxis_builds_one_node_srun_command(monkeypatch, tmp_path):
     ]
 
 
+def test_pyxis_builds_srun_command_for_placement_node(monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.delenv("SLURMD_NODENAME", raising=False)
+
+    command = build_srun_command(argv=["true"], node="worker-02")
+
+    assert "--nodelist=worker-02" in command
+
+
 def test_pyxis_rejects_commas_in_mount_paths(monkeypatch, tmp_path):
     monkeypatch.setenv("SLURM_JOB_ID", "1738605")
     monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
@@ -1338,6 +1348,7 @@ def test_pyxis_cleanup_removes_only_exact_run_prefix(monkeypatch, tmp_path):
             output = (
                 "NAME PID COMM STATE STARTED TIME MNTNS USERNS COMMAND\n"
                 "pyxis_mswe_run-1_abcd1234                         \n"
+                "pyxis_1738605_mswe_run-1_fedcba98                 \n"
                 "pyxis_mswe_run-10_ffff0000                        \n"
                 "unrelated                                         \n"
             )
@@ -1353,7 +1364,155 @@ def test_pyxis_cleanup_removes_only_exact_run_prefix(monkeypatch, tmp_path):
     runner._cleanup_containers("run-1")
 
     assert [command[-4:] for command in calls[1:]] == [
-        ["enroot", "remove", "-f", "pyxis_mswe_run-1_abcd1234"]
+        ["enroot", "remove", "-f", "pyxis_mswe_run-1_abcd1234"],
+        ["enroot", "remove", "-f", "pyxis_1738605_mswe_run-1_fedcba98"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "contents, match",
+    [
+        ("repo__repo-1 worker-a\n", "expected instance_id"),
+        ("repo__repo-1\tworker-a\nrepo__repo-1\tworker-b\n", "duplicate"),
+        ("repo__repo-1\tworker a\n", "invalid Slurm node"),
+    ],
+)
+def test_pyxis_placement_file_requires_unique_tsv_rows(tmp_path, contents, match):
+    placement_file = tmp_path / "placement.tsv"
+    placement_file.write_text(contents)
+
+    with pytest.raises(RunnerError, match=match):
+        load_pyxis_placement(placement_file)
+
+
+def test_pyxis_placement_snapshot_is_exact_and_read_only(monkeypatch, tmp_path):
+    shared_root = tmp_path / "shared"
+    run_dir = shared_root / "run-1"
+    placement_file = tmp_path / "placement.tsv"
+    placement_file.write_text("repo__repo-1\tworker-a\nrepo__repo-2\tworker-b\n")
+    commands: list[list[str]] = []
+
+    def fake_subprocess(command, *args, **kwargs):
+        commands.append(command)
+
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_registry=_PYXIS_IMAGE_REGISTRY,
+        pyxis_placement_file=placement_file,
+        pyxis_shared_runtime_root=shared_root,
+    )
+    request = _pyxis_request(["repo__repo-2", "repo__repo-1"])
+    monkeypatch.setattr(runner_mod, "_run_subprocess", fake_subprocess)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    def fake_run(request, run_dir, cancel_token):
+        runner._run_agent(
+            request, tmp_path / "config.yaml", run_dir / "output", run_dir, set()
+        )
+        return {}
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+
+    assert runner.run(request, run_dir) == {}
+    snapshot = run_dir / "pyxis_placement.tsv"
+    assert snapshot.read_text() == "repo__repo-2\tworker-b\nrepo__repo-1\tworker-a\n"
+    assert stat.S_IMODE(snapshot.stat().st_mode) == 0o444
+    assert commands[0][commands[0].index("--placement-file") + 1] == str(snapshot)
+    assert commands[0][commands[0].index("--shared-runtime-root") + 1] == str(
+        shared_root.resolve()
+    )
+
+
+def test_pyxis_placement_rejects_missing_or_unshared_runtime_root(tmp_path):
+    placement_file = tmp_path / "placement.tsv"
+    placement_file.write_text("repo__repo-1\tworker-a\n")
+
+    with pytest.raises(ValueError, match="requires --pyxis-shared-runtime-root"):
+        PyxisSweBenchRunner(
+            project_root=tmp_path,
+            subprocess_timeout_s=30,
+            image_registry=_PYXIS_IMAGE_REGISTRY,
+            pyxis_placement_file=placement_file,
+        )
+
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_registry=_PYXIS_IMAGE_REGISTRY,
+        pyxis_placement_file=placement_file,
+        pyxis_shared_runtime_root=tmp_path / "shared",
+    )
+    with pytest.raises(RunnerError, match="artifact root"):
+        runner.run(_pyxis_request(), tmp_path / "outside-shared-root")
+
+
+def test_pyxis_environment_uses_shared_root_on_placement_node(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "controller")
+    image = tmp_path / "task.sqsh"
+    image.touch()
+    shared_root = tmp_path / "shared"
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        _finish_srun_step(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    environment = PyxisEnvironment(
+        image=image,
+        run_id="run-1",
+        node="worker-b",
+        shared_runtime_root=shared_root,
+    )
+
+    mount = next(arg for arg in calls[0] if arg.startswith("--container-mounts="))
+    source = Path(mount.removeprefix("--container-mounts=").split(":", 1)[0])
+    assert source.is_relative_to(shared_root)
+    assert source.parent == shared_root / "pyxis-runtime"
+    assert "--nodelist=worker-b" in calls[0]
+    environment.cleanup()
+
+
+def test_pyxis_cleanup_checks_each_placement_node(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "controller")
+    placement_file = tmp_path / "placement.tsv"
+    placement_file.write_text("repo__repo-1\tworker-a\nrepo__repo-2\tworker-b\n")
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[-3:] == ["enroot", "list", "-f"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="pyxis_mswe_run-1_deadbeef\nunrelated\n", stderr=""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_registry=_PYXIS_IMAGE_REGISTRY,
+        pyxis_placement_file=placement_file,
+        pyxis_shared_runtime_root=tmp_path,
+    )
+    runner._placements_by_run["run-1"] = load_pyxis_placement(placement_file)
+
+    runner._cleanup_containers("run-1")
+
+    assert [
+        argument
+        for command in calls
+        for argument in command
+        if argument.startswith("--nodelist=")
+    ] == [
+        "--nodelist=worker-a",
+        "--nodelist=worker-a",
+        "--nodelist=worker-b",
+        "--nodelist=worker-b",
     ]
 
 

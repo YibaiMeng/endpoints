@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse, urlunparse
@@ -89,6 +90,90 @@ _SWEBENCH_DATASETS = {
     "verified": "princeton-nlp/SWE-bench_Verified",
     "lite": "princeton-nlp/SWE-bench_Lite",
 }
+
+
+@dataclass(frozen=True)
+class PyxisPlacement:
+    """Trusted assignment of a SWE-bench instance to an allocated Slurm node."""
+
+    nodes_by_instance: dict[str, str]
+
+    def node_for(self, instance_id: str) -> str:
+        try:
+            return self.nodes_by_instance[instance_id]
+        except KeyError as exc:
+            raise RunnerError(
+                f"Pyxis placement does not contain requested instance {instance_id}"
+            ) from exc
+
+    @property
+    def nodes(self) -> tuple[str, ...]:
+        return tuple(sorted(set(self.nodes_by_instance.values())))
+
+    def require_exact_instances(self, instance_ids: list[str]) -> None:
+        expected = set(instance_ids)
+        actual = set(self.nodes_by_instance)
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        if missing or extra:
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing[:10]))
+            if extra:
+                details.append("unexpected: " + ", ".join(extra[:10]))
+            raise RunnerError(
+                "Pyxis placement must match requested instances exactly ("
+                + "; ".join(details)
+                + ")"
+            )
+
+    def write_snapshot(self, path: Path, instance_ids: list[str]) -> None:
+        self.require_exact_instances(instance_ids)
+        contents = "".join(
+            f"{instance_id}\t{self.node_for(instance_id)}\n"
+            for instance_id in instance_ids
+        )
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(contents)
+            path.chmod(0o444)
+        except FileExistsError as exc:
+            raise RunnerError(
+                f"Pyxis placement snapshot already exists: {path}"
+            ) from exc
+        except OSError as exc:
+            raise RunnerError(
+                f"could not write Pyxis placement snapshot {path}: {exc}"
+            ) from exc
+
+
+def load_pyxis_placement(path: Path) -> PyxisPlacement:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RunnerError(f"could not read Pyxis placement file {path}: {exc}") from exc
+
+    nodes_by_instance: dict[str, str] = {}
+    for line_number, line in enumerate(lines, start=1):
+        instance_id, separator, node = line.partition("\t")
+        if not separator or not instance_id or not node or "\t" in node:
+            raise RunnerError(
+                f"invalid Pyxis placement at {path}:{line_number}; "
+                "expected instance_id<TAB>node"
+            )
+        if instance_id in nodes_by_instance:
+            raise RunnerError(
+                f"duplicate instance ID in Pyxis placement at {path}:{line_number}: "
+                f"{instance_id}"
+            )
+        if any(character.isspace() for character in node):
+            raise RunnerError(
+                f"invalid Slurm node in Pyxis placement at {path}:{line_number}: {node}"
+            )
+        nodes_by_instance[instance_id] = node
+    if not nodes_by_instance:
+        raise RunnerError(f"Pyxis placement file {path} is empty")
+    return PyxisPlacement(nodes_by_instance)
 
 
 def _prepare_eval(request: RunRequest, run_dir: Path) -> tuple[str, str]:
@@ -637,12 +722,68 @@ class PyxisSweBenchRunner(SweBenchRunner):
         project_root: Path,
         subprocess_timeout_s: int,
         image_registry: str,
+        pyxis_placement_file: Path | None = None,
+        pyxis_shared_runtime_root: Path | None = None,
     ):
         super().__init__(
             project_root=project_root,
             subprocess_timeout_s=subprocess_timeout_s,
         )
         self.image_registry = image_registry
+        if pyxis_placement_file is None:
+            if pyxis_shared_runtime_root is not None:
+                raise ValueError(
+                    "--pyxis-shared-runtime-root requires --pyxis-placement-file"
+                )
+            self._placement_file = None
+            self._shared_runtime_root = None
+        else:
+            if pyxis_shared_runtime_root is None:
+                raise ValueError(
+                    "--pyxis-placement-file requires --pyxis-shared-runtime-root"
+                )
+            if not pyxis_shared_runtime_root.is_absolute():
+                raise ValueError("--pyxis-shared-runtime-root must be absolute")
+            self._placement_file = pyxis_placement_file.resolve()
+            self._shared_runtime_root = pyxis_shared_runtime_root.resolve()
+        self._placements_by_run: dict[str, PyxisPlacement] = {}
+        self._placement_lock = threading.Lock()
+
+    def run(
+        self,
+        request: RunRequest,
+        run_dir: Path,
+        cancel_token: CancellationToken | None = None,
+    ) -> dict[str, Any]:
+        if self._placement_file is None:
+            return super().run(request, run_dir, cancel_token)
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        resolved_run_dir = run_dir.resolve()
+        assert self._shared_runtime_root is not None
+        try:
+            resolved_run_dir.relative_to(self._shared_runtime_root)
+        except ValueError as exc:
+            raise RunnerError(
+                "Pyxis placement requires the service artifact root to be under "
+                f"the shared runtime root {self._shared_runtime_root}"
+            ) from exc
+
+        placement = load_pyxis_placement(self._placement_file)
+        snapshot_path = run_dir / "pyxis_placement.tsv"
+        placement.write_snapshot(snapshot_path, request.evaluated_instance_ids)
+        snapshot = load_pyxis_placement(snapshot_path)
+        with self._placement_lock:
+            self._placements_by_run[run_dir.name] = snapshot
+        try:
+            return super().run(request, run_dir, cancel_token)
+        finally:
+            with self._placement_lock:
+                self._placements_by_run.pop(run_dir.name, None)
+
+    def _placement_for_run(self, run_dir: Path) -> PyxisPlacement | None:
+        with self._placement_lock:
+            return self._placements_by_run.get(run_dir.name)
 
     def _configure_environment(
         self, environment_cfg: dict[str, Any], run_id: str
@@ -669,6 +810,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
         secret_values: set[str],
         cancel_token: CancellationToken | None = None,
     ) -> None:
+        placement = self._placement_for_run(run_dir)
         command = [
             sys.executable,
             "-m",
@@ -691,6 +833,16 @@ class PyxisSweBenchRunner(SweBenchRunner):
             "--image-registry",
             self.image_registry,
         ]
+        if placement is not None:
+            assert self._shared_runtime_root is not None
+            command.extend(
+                [
+                    "--placement-file",
+                    str(run_dir / "pyxis_placement.tsv"),
+                    "--shared-runtime-root",
+                    str(self._shared_runtime_root),
+                ]
+            )
         self._run_logged_subprocess(
             command,
             run_dir / "swe_bench_agent.log",
@@ -711,6 +863,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
         cancel_token: CancellationToken | None = None,
     ) -> Path:
         run_id, dataset_name = _prepare_eval(request, run_dir)
+        placement = self._placement_for_run(run_dir)
         command = [
             sys.executable,
             "-m",
@@ -733,6 +886,16 @@ class PyxisSweBenchRunner(SweBenchRunner):
             "--instance-ids",
             *request.evaluated_instance_ids,
         ]
+        if placement is not None:
+            assert self._shared_runtime_root is not None
+            command.extend(
+                [
+                    "--placement-file",
+                    str(run_dir / "pyxis_placement.tsv"),
+                    "--shared-runtime-root",
+                    str(self._shared_runtime_root),
+                ]
+            )
         env = dict(os.environ)
         env.pop("OPENAI_API_KEY", None)
         self._run_logged_subprocess(
@@ -758,28 +921,36 @@ class PyxisSweBenchRunner(SweBenchRunner):
 
         del eval_run_id, instance_ids
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)[:24]
-        prefix = f"pyxis_mswe_{safe_run_id}_"
+        container_name = re.compile(
+            rf"^pyxis_(?:[0-9]+_)?mswe_{re.escape(safe_run_id)}_"
+        )
+        with self._placement_lock:
+            placement = self._placements_by_run.get(run_id)
+        nodes: tuple[str | None, ...] = placement.nodes if placement else (None,)
         try:
-            listed = subprocess.run(
-                build_srun_command(argv=["enroot", "list", "-f"]),
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=safe_srun_env(),
-            )
-            for line in listed.stdout.splitlines():
-                fields = line.split(maxsplit=1)
-                name = fields[0] if fields else ""
-                if name.startswith(prefix):
-                    subprocess.run(
-                        build_srun_command(argv=["enroot", "remove", "-f", name]),
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                        env=safe_srun_env(),
-                    )
+            for node in nodes:
+                listed = subprocess.run(
+                    build_srun_command(argv=["enroot", "list", "-f"], node=node),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=safe_srun_env(),
+                )
+                for line in listed.stdout.splitlines():
+                    fields = line.split(maxsplit=1)
+                    name = fields[0] if fields else ""
+                    if container_name.match(name):
+                        subprocess.run(
+                            build_srun_command(
+                                argv=["enroot", "remove", "-f", name], node=node
+                            ),
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            env=safe_srun_env(),
+                        )
         except (OSError, subprocess.SubprocessError) as exc:
             raise RunnerError(
                 f"failed to clean up Pyxis containers for SWE-bench run {run_id}"
@@ -792,6 +963,8 @@ def create_runner(
     project_root: Path,
     subprocess_timeout_s: int,
     image_registry: str | None,
+    pyxis_placement_file: Path | None = None,
+    pyxis_shared_runtime_root: Path | None = None,
 ) -> RunnerProtocol:
     if runtime == "docker":
         return SweBenchRunner(
@@ -805,5 +978,7 @@ def create_runner(
             project_root=project_root,
             subprocess_timeout_s=subprocess_timeout_s,
             image_registry=image_registry,
+            pyxis_placement_file=pyxis_placement_file,
+            pyxis_shared_runtime_root=pyxis_shared_runtime_root,
         )
     raise ValueError(f"unknown SWE-bench runtime: {runtime}")

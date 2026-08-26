@@ -15,7 +15,7 @@ from typing import Any
 
 from .artifacts import atomic_write_bytes
 from .pyxis_environment import resolve_image, run_srun_step
-from .runner import RunnerError
+from .runner import RunnerError, load_pyxis_placement
 
 _PRINT_LOCK = threading.Lock()
 _INFRASTRUCTURE_FAILURE = ".pyxis_infrastructure_failure"
@@ -66,6 +66,11 @@ def _run_agent(args: argparse.Namespace) -> None:
         environment_config["image"] = resolve_image(
             args.image_registry, instance["instance_id"]
         )
+        if args.placement is not None:
+            environment_config["node"] = args.placement.node_for(
+                instance["instance_id"]
+            )
+            environment_config["shared_runtime_root"] = str(args.shared_runtime_root)
         environment_config["infrastructure_failure_path"] = str(failure_path)
         return get_environment(environment_config)
 
@@ -104,6 +109,7 @@ def _evaluate_instance(
     output_dir: Path,
     run_id: str,
     timeout_s: int,
+    node: str | None = None,
 ) -> None:
     instance_id = test_spec.instance_id
     safe_model = prediction["model_name_or_path"].replace("/", "__")
@@ -142,6 +148,7 @@ def _evaluate_instance(
             "/tmp/swebench_test_output.txt",
             str(timeout_s),
         ],
+        node=node,
     )
     with _PRINT_LOCK:
         print(f"[{instance_id}]\n{result.stdout}{result.stderr}", flush=True)
@@ -200,6 +207,11 @@ def _run_eval(args: argparse.Namespace) -> None:
                 "output_dir": args.output_dir,
                 "run_id": args.run_id,
                 "timeout_s": args.timeout,
+                "node": (
+                    args.placement.node_for(instance_id)
+                    if args.placement is not None
+                    else None
+                ),
             }
         )
 
@@ -249,6 +261,8 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument("--workers", type=int, required=True)
     agent_parser.add_argument("--output", type=Path, required=True)
     agent_parser.add_argument("--image-registry", required=True)
+    agent_parser.add_argument("--placement-file", type=Path)
+    agent_parser.add_argument("--shared-runtime-root", type=Path)
 
     eval_parser = commands.add_parser("eval")
     eval_parser.add_argument("--dataset-name", required=True)
@@ -260,7 +274,31 @@ def main(argv: list[str] | None = None) -> None:
     eval_parser.add_argument("--output-dir", type=Path, required=True)
     eval_parser.add_argument("--timeout", type=int, default=1800)
     eval_parser.add_argument("--instance-ids", nargs="+", required=True)
+    eval_parser.add_argument("--placement-file", type=Path)
+    eval_parser.add_argument("--shared-runtime-root", type=Path)
     args = parser.parse_args(argv)
+
+    if (args.placement_file is None) != (args.shared_runtime_root is None):
+        parser.error("--placement-file and --shared-runtime-root must be used together")
+    if args.shared_runtime_root is not None:
+        if not args.shared_runtime_root.is_absolute():
+            parser.error("--shared-runtime-root must be absolute")
+        args.shared_runtime_root = args.shared_runtime_root.resolve()
+        artifact_path = (
+            args.output if args.command == "agent" else args.output_dir
+        ).resolve()
+        try:
+            artifact_path.relative_to(args.shared_runtime_root)
+        except ValueError:
+            parser.error(
+                "Pyxis placement requires agent and evaluation artifacts under "
+                "--shared-runtime-root"
+            )
+    args.placement = (
+        load_pyxis_placement(args.placement_file)
+        if args.placement_file is not None
+        else None
+    )
 
     if args.command == "agent":
         _run_agent(args)

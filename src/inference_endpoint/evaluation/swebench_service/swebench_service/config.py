@@ -29,3 +29,5 @@ class ServiceConfig:
     auth_token: str | None = None
     allow_unauthenticated: bool = False
     max_stored_runs: int = 100
+    pyxis_placement_file: Path | None = None
+    pyxis_shared_runtime_root: Path | None = None

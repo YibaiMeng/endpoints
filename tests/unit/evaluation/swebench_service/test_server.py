@@ -252,6 +252,24 @@ def test_service_requires_auth_or_explicit_development_override(tmp_path):
         create_app(ServiceConfig(artifact_root=tmp_path), runner=FakeRunner())
 
 
+def test_create_app_preserves_pyxis_placement_configuration(tmp_path):
+    placement_file = tmp_path / "placement.tsv"
+    shared_root = tmp_path / "shared"
+    app = create_app(
+        ServiceConfig(
+            artifact_root=tmp_path / "artifacts",
+            allow_unauthenticated=True,
+            pyxis_placement_file=placement_file,
+            pyxis_shared_runtime_root=shared_root,
+        ),
+        runner=FakeRunner(),
+    )
+
+    config = app[MANAGER_KEY].config
+    assert config.pyxis_placement_file == placement_file
+    assert config.pyxis_shared_runtime_root == shared_root
+
+
 @pytest.mark.asyncio
 async def test_runner_transitions_to_succeeded(tmp_path):
     runner = FakeRunner()

@@ -581,6 +581,8 @@ def create_app(
         auth_token=config.auth_token,
         allow_unauthenticated=config.allow_unauthenticated,
         max_stored_runs=config.max_stored_runs,
+        pyxis_placement_file=config.pyxis_placement_file,
+        pyxis_shared_runtime_root=config.pyxis_shared_runtime_root,
     )
     config.artifact_root.mkdir(parents=True, exist_ok=True)
     runner = runner or SweBenchRunner(
