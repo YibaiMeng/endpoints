@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import json
 import logging
 import stat
 import subprocess
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from typing import Literal, get_type_hints
@@ -15,6 +17,9 @@ import msgspec.json
 import pytest
 import yaml
 from inference_endpoint.evaluation.swebench_service.swebench_service import (
+    pyxis_environment as pyxis_environment_mod,
+)
+from inference_endpoint.evaluation.swebench_service.swebench_service import (
     pyxis_worker as worker_mod,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service import (
@@ -22,8 +27,10 @@ from inference_endpoint.evaluation.swebench_service.swebench_service import (
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.pyxis_environment import (
     PyxisEnvironment,
+    PyxisStepLimits,
     build_srun_command,
     resolve_image,
+    run_srun_step,
     safe_srun_env,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.runner import (
@@ -628,10 +635,12 @@ def _finish_srun_step(command: list[str], returncode: int) -> None:
     raise AssertionError("srun command does not mount its status file")
 
 
-def _install_fake_minisweagent(monkeypatch, swebench) -> None:
+def _install_fake_minisweagent(monkeypatch, swebench, *, get_environment=None) -> None:
     minisweagent = types.ModuleType("minisweagent")
     environments = types.ModuleType("minisweagent.environments")
-    environments.get_environment = lambda config: config  # type: ignore[attr-defined]
+    environments.get_environment = get_environment or (  # type: ignore[attr-defined]
+        lambda config: config
+    )
     run = types.ModuleType("minisweagent.run")
     benchmarks = types.ModuleType("minisweagent.run.benchmarks")
     benchmarks.swebench = swebench  # type: ignore[attr-defined]
@@ -851,6 +860,146 @@ def test_pyxis_srun_environment_does_not_forward_credentials(monkeypatch):
     assert "OPENAI_API_KEY" not in environment
     assert "SWEBENCH_SERVICE_AUTH_TOKEN" not in environment
     assert "HF_TOKEN" not in environment
+
+
+def test_pyxis_srun_environment_keeps_enroot_runtime_paths(monkeypatch):
+    monkeypatch.setenv("ENROOT_TEMP_PATH", "/shared/enroot/tmp")
+    monkeypatch.setenv("ENROOT_CONFIG_PATH", "/shared/enroot/config")
+
+    environment = safe_srun_env()
+
+    assert environment["ENROOT_TEMP_PATH"] == "/shared/enroot/tmp"
+    assert environment["ENROOT_CONFIG_PATH"] == "/shared/enroot/config"
+
+
+def test_pyxis_step_limits_bound_multithreaded_creates_and_steps():
+    limits = PyxisStepLimits(
+        max_concurrent_creates=1,
+        max_concurrent_srun_steps=2,
+    )
+    lock = threading.Lock()
+    started = threading.Event()
+    active_creates = 0
+    active_steps = 0
+    peak_creates = 0
+    peak_steps = 0
+
+    def run(create: bool) -> None:
+        nonlocal active_creates, active_steps, peak_creates, peak_steps
+        started.wait()
+        with limits.admit(create=create, deadline=time.monotonic() + 10):
+            with lock:
+                active_steps += 1
+                active_creates += int(create)
+                peak_creates = max(peak_creates, active_creates)
+                peak_steps = max(peak_steps, active_steps)
+            time.sleep(0.03)
+            with lock:
+                active_steps -= 1
+                active_creates -= int(create)
+
+    create_threads = [threading.Thread(target=run, args=(True,)) for _ in range(6)]
+    for thread in create_threads:
+        thread.start()
+    started.set()
+    for thread in create_threads:
+        thread.join()
+
+    assert peak_creates == 1
+
+    started.clear()
+    step_threads = [threading.Thread(target=run, args=(False,)) for _ in range(6)]
+    for thread in step_threads:
+        thread.start()
+    started.set()
+    for thread in step_threads:
+        thread.join()
+
+    assert peak_steps == 2
+
+
+def test_pyxis_step_limits_release_partial_admission(monkeypatch):
+    limits = PyxisStepLimits(
+        max_concurrent_creates=1,
+        max_concurrent_srun_steps=1,
+    )
+
+    with limits.admit(create=False, deadline=float("inf")):
+        clock = iter([0.0, 2.0])
+        monkeypatch.setattr(
+            pyxis_environment_mod.time, "monotonic", lambda: next(clock)
+        )
+        with pytest.raises(RunnerError, match="concurrency slot"):
+            with limits.admit(create=True, deadline=1.0):
+                pass
+        assert limits._creates is not None
+        assert limits._creates.acquire(blocking=False)
+        limits._creates.release()
+
+
+def test_pyxis_step_queue_time_reduces_subprocess_deadline(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "worker-a")
+    limits = PyxisStepLimits(launch_grace_s=20)
+    clock = iter([100.0, 102.25])
+    monkeypatch.setattr(pyxis_environment_mod.time, "monotonic", lambda: next(clock))
+    observed: dict[str, float] = {}
+    status_path = tmp_path / "status"
+
+    def fake_admit(*, create, deadline):
+        assert create is False
+        assert deadline == pytest.approx(130.0)
+
+        class Admission:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *args):
+                return None
+
+        return Admission()
+
+    def fake_run(command, **kwargs):
+        observed["timeout"] = kwargs["timeout"]
+        status_path.write_text("finished:0\n")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(limits, "admit", fake_admit)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_srun_step(
+        argv=["true"],
+        status_path=status_path,
+        timeout_s=10,
+        step_limits=limits,
+    )
+
+    assert observed["timeout"] == pytest.approx(27.75, abs=0.001)
+
+
+def test_pyxis_admission_timeout_marks_infrastructure_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "worker-a")
+    limits = PyxisStepLimits(max_concurrent_srun_steps=1, launch_grace_s=0)
+    failure_path = tmp_path / "failure"
+
+    class FullSemaphore:
+        def acquire(self, *, timeout):
+            assert timeout == pytest.approx(10.0, abs=0.001)
+            return False
+
+    limits._steps = FullSemaphore()  # type: ignore[assignment]
+
+    with pytest.raises(RunnerError, match="concurrency slot"):
+        run_srun_step(
+            argv=["true"],
+            status_path=tmp_path / "status",
+            timeout_s=10,
+            failure_path=failure_path,
+            step_limits=limits,
+        )
+
+    assert failure_path.exists()
 
 
 def test_pyxis_environment_reuses_named_writable_container(
@@ -1118,11 +1267,11 @@ def test_pyxis_container_create_uses_the_pull_budget_not_the_command_budget(
     environment.execute({"command": "pytest -q"})
 
     create_timeout, command_timeout = timeouts[0], timeouts[1]
-    assert create_timeout == 3600 + 30
-    assert command_timeout == 300 + 30
-    assert create_timeout > command_timeout, (
-        "container creation must not be bounded by the per-command timeout"
-    )
+    assert create_timeout == pytest.approx(3600 + 30, abs=0.001)
+    assert command_timeout == pytest.approx(300 + 30, abs=0.001)
+    assert (
+        create_timeout > command_timeout
+    ), "container creation must not be bounded by the per-command timeout"
     environment.cleanup()
 
 
@@ -1144,7 +1293,7 @@ def test_pyxis_container_create_budget_defaults_without_a_template_value(
         image=tmp_path / "task.sqsh", run_id="run-1", timeout=300
     )
 
-    assert timeouts[0] == 3600 + 30
+    assert timeouts[0] == pytest.approx(3600 + 30, abs=0.001)
     environment.cleanup()
 
 
@@ -1529,6 +1678,9 @@ def test_pyxis_agent_command_uses_host_model_and_image_registry(monkeypatch, tmp
         project_root=tmp_path,
         subprocess_timeout_s=30,
         image_registry=_PYXIS_IMAGE_REGISTRY,
+        pyxis_max_concurrent_creates=3,
+        pyxis_max_concurrent_srun_steps=5,
+        pyxis_srun_launch_grace_s=45,
     )
 
     runner._run_agent(
@@ -1542,6 +1694,9 @@ def test_pyxis_agent_command_uses_host_model_and_image_registry(monkeypatch, tmp
     command, kwargs = calls[0]
     assert command[1:4] == ["-m", "swebench_service.pyxis_worker", "agent"]
     assert command[command.index("--image-registry") + 1] == _PYXIS_IMAGE_REGISTRY
+    assert command[command.index("--max-concurrent-creates") + 1] == "3"
+    assert command[command.index("--max-concurrent-srun-steps") + 1] == "5"
+    assert command[command.index("--srun-launch-grace-s") + 1] == "45"
     assert command[command.index("--filter") + 1] == (
         "^(?:repo__repo\\-1|repo__repo\\-2)$"
     )
@@ -1567,6 +1722,44 @@ def test_pyxis_agent_restores_upstream_environment_hook(monkeypatch, tmp_path):
     worker_mod.main(_pyxis_agent_args(tmp_path))
 
     assert swebench.get_sb_environment is original
+
+
+def test_pyxis_agent_shares_step_limits_through_environment_construction(
+    monkeypatch, tmp_path
+):
+    original = object()
+    observed: dict[str, PyxisStepLimits] = {}
+
+    def get_environment(config):
+        observed["before_copy"] = config["step_limits"]
+        constructed = copy.deepcopy(config)
+        observed["after_copy"] = constructed["step_limits"]
+        return constructed
+
+    def fake_main(**kwargs):
+        swebench.get_sb_environment(
+            {"environment": {}}, {"instance_id": "repo__repo-1"}
+        )
+
+    swebench = types.SimpleNamespace(
+        get_sb_environment=original,
+        main=fake_main,
+    )
+    _install_fake_minisweagent(
+        monkeypatch,
+        swebench,
+        get_environment=get_environment,
+    )
+
+    worker_mod.main(
+        [
+            *_pyxis_agent_args(tmp_path),
+            "--max-concurrent-srun-steps",
+            "1",
+        ]
+    )
+
+    assert observed["after_copy"] is observed["before_copy"]
 
 
 def test_pyxis_agent_propagates_environment_infrastructure_failure(
@@ -1690,6 +1883,47 @@ def test_pyxis_eval_does_not_mount_report_directory(monkeypatch, tmp_path):
     assert "report.json" not in mounts
     assert f"{report.parent.resolve()}:/" not in mounts
     assert not report.exists()
+
+
+def test_pyxis_evaluate_instance_admits_image_creation(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    limits = PyxisStepLimits(max_concurrent_creates=1)
+    observed: dict[str, bool] = {}
+
+    def fake_admit(*, create, deadline):
+        observed["create"] = create
+
+        class Admission:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *args):
+                return None
+
+        return Admission()
+
+    def fake_run(command, **kwargs):
+        _finish_srun_step(command, 1)
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="failed")
+
+    monkeypatch.setattr(limits, "admit", fake_admit)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    worker_mod._evaluate_instance(
+        test_spec=types.SimpleNamespace(instance_id="repo__repo-1", eval_script="true"),
+        prediction={
+            "model_name_or_path": "test-model",
+            "model_patch": "diff --git a/a b/a",
+        },
+        image=tmp_path / "task.sqsh",
+        output_dir=tmp_path,
+        run_id="run-1",
+        timeout_s=30,
+        step_limits=limits,
+    )
+
+    assert observed["create"] is True
 
 
 def test_pyxis_evaluate_instance_writes_upstream_report(monkeypatch, tmp_path):

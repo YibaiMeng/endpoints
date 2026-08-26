@@ -583,6 +583,9 @@ def create_app(
         max_stored_runs=config.max_stored_runs,
         pyxis_placement_file=config.pyxis_placement_file,
         pyxis_shared_runtime_root=config.pyxis_shared_runtime_root,
+        pyxis_max_concurrent_creates=config.pyxis_max_concurrent_creates,
+        pyxis_max_concurrent_srun_steps=config.pyxis_max_concurrent_srun_steps,
+        pyxis_srun_launch_grace_s=config.pyxis_srun_launch_grace_s,
     )
     config.artifact_root.mkdir(parents=True, exist_ok=True)
     runner = runner or SweBenchRunner(

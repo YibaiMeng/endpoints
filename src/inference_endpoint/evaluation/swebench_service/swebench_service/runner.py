@@ -724,12 +724,18 @@ class PyxisSweBenchRunner(SweBenchRunner):
         image_registry: str,
         pyxis_placement_file: Path | None = None,
         pyxis_shared_runtime_root: Path | None = None,
+        pyxis_max_concurrent_creates: int | None = None,
+        pyxis_max_concurrent_srun_steps: int | None = None,
+        pyxis_srun_launch_grace_s: int = 30,
     ):
         super().__init__(
             project_root=project_root,
             subprocess_timeout_s=subprocess_timeout_s,
         )
         self.image_registry = image_registry
+        self.pyxis_max_concurrent_creates = pyxis_max_concurrent_creates
+        self.pyxis_max_concurrent_srun_steps = pyxis_max_concurrent_srun_steps
+        self.pyxis_srun_launch_grace_s = pyxis_srun_launch_grace_s
         if pyxis_placement_file is None:
             if pyxis_shared_runtime_root is not None:
                 raise ValueError(
@@ -832,7 +838,23 @@ class PyxisSweBenchRunner(SweBenchRunner):
             str(output_dir),
             "--image-registry",
             self.image_registry,
+            "--srun-launch-grace-s",
+            str(self.pyxis_srun_launch_grace_s),
         ]
+        if self.pyxis_max_concurrent_creates is not None:
+            command.extend(
+                [
+                    "--max-concurrent-creates",
+                    str(self.pyxis_max_concurrent_creates),
+                ]
+            )
+        if self.pyxis_max_concurrent_srun_steps is not None:
+            command.extend(
+                [
+                    "--max-concurrent-srun-steps",
+                    str(self.pyxis_max_concurrent_srun_steps),
+                ]
+            )
         if placement is not None:
             assert self._shared_runtime_root is not None
             command.extend(
@@ -883,9 +905,23 @@ class PyxisSweBenchRunner(SweBenchRunner):
             self.image_registry,
             "--output-dir",
             str(output_dir),
-            "--instance-ids",
-            *request.evaluated_instance_ids,
+            "--srun-launch-grace-s",
+            str(self.pyxis_srun_launch_grace_s),
         ]
+        if self.pyxis_max_concurrent_creates is not None:
+            command.extend(
+                [
+                    "--max-concurrent-creates",
+                    str(self.pyxis_max_concurrent_creates),
+                ]
+            )
+        if self.pyxis_max_concurrent_srun_steps is not None:
+            command.extend(
+                [
+                    "--max-concurrent-srun-steps",
+                    str(self.pyxis_max_concurrent_srun_steps),
+                ]
+            )
         if placement is not None:
             assert self._shared_runtime_root is not None
             command.extend(
@@ -896,6 +932,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
                     str(self._shared_runtime_root),
                 ]
             )
+        command.extend(["--instance-ids", *request.evaluated_instance_ids])
         env = dict(os.environ)
         env.pop("OPENAI_API_KEY", None)
         self._run_logged_subprocess(
@@ -965,6 +1002,9 @@ def create_runner(
     image_registry: str | None,
     pyxis_placement_file: Path | None = None,
     pyxis_shared_runtime_root: Path | None = None,
+    pyxis_max_concurrent_creates: int | None = None,
+    pyxis_max_concurrent_srun_steps: int | None = None,
+    pyxis_srun_launch_grace_s: int = 30,
 ) -> RunnerProtocol:
     if runtime == "docker":
         return SweBenchRunner(
@@ -980,5 +1020,8 @@ def create_runner(
             image_registry=image_registry,
             pyxis_placement_file=pyxis_placement_file,
             pyxis_shared_runtime_root=pyxis_shared_runtime_root,
+            pyxis_max_concurrent_creates=pyxis_max_concurrent_creates,
+            pyxis_max_concurrent_srun_steps=pyxis_max_concurrent_srun_steps,
+            pyxis_srun_launch_grace_s=pyxis_srun_launch_grace_s,
         )
     raise ValueError(f"unknown SWE-bench runtime: {runtime}")

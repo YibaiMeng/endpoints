@@ -31,3 +31,6 @@ class ServiceConfig:
     max_stored_runs: int = 100
     pyxis_placement_file: Path | None = None
     pyxis_shared_runtime_root: Path | None = None
+    pyxis_max_concurrent_creates: int | None = None
+    pyxis_max_concurrent_srun_steps: int | None = None
+    pyxis_srun_launch_grace_s: int = 30

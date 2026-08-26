@@ -88,6 +88,15 @@ files mounted by remote Pyxis steps are visible on their assigned nodes. Contain
 cleanup runs on every node named in the placement file. Temporary container state
 is created below `$RUN_DIR/pyxis-runtime`.
 
+### Pyxis step limits
+
+`--pyxis-max-concurrent-creates` and
+`--pyxis-max-concurrent-srun-steps` bound work in each agent or evaluator
+process. Leave either unset to preserve the existing unlimited behavior. The
+outer deadline for a nested step is its command timeout plus
+`--pyxis-srun-launch-grace-s` (30 seconds by default), reserving time for Slurm
+to start the step.
+
 The benchmark client submits a run to this service only in `ACC` or `BOTH`
 mode; the default `PERF` mode skips external evaluation.
 

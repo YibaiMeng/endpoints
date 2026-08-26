@@ -261,6 +261,9 @@ def test_create_app_preserves_pyxis_placement_configuration(tmp_path):
             allow_unauthenticated=True,
             pyxis_placement_file=placement_file,
             pyxis_shared_runtime_root=shared_root,
+            pyxis_max_concurrent_creates=2,
+            pyxis_max_concurrent_srun_steps=4,
+            pyxis_srun_launch_grace_s=45,
         ),
         runner=FakeRunner(),
     )
@@ -268,6 +271,9 @@ def test_create_app_preserves_pyxis_placement_configuration(tmp_path):
     config = app[MANAGER_KEY].config
     assert config.pyxis_placement_file == placement_file
     assert config.pyxis_shared_runtime_root == shared_root
+    assert config.pyxis_max_concurrent_creates == 2
+    assert config.pyxis_max_concurrent_srun_steps == 4
+    assert config.pyxis_srun_launch_grace_s == 45
 
 
 @pytest.mark.asyncio
