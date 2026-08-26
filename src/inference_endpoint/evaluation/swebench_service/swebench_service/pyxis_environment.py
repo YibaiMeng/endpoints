@@ -56,7 +56,7 @@ _SAFE_SRUN_ENV = (
     "SLURM_CONF",
 )
 _STEP_STATUS = "/tmp/.mlperf_srun_status"
-_SRUN_STEP_ATTEMPTS = 3
+_SRUN_STEP_ATTEMPTS = 10
 _SRUN_LAUNCH_RETRY_DELAY_S = 1
 _STEP_SCRIPT = r"""set +e
 status_path=$1

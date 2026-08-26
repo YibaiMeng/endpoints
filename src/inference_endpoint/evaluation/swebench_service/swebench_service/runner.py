@@ -398,9 +398,14 @@ class SweBenchRunner:
         self._validate_prediction_ids(request, preds_path)
         shutil.copy2(preds_path, run_dir / "preds.json")
 
-        result_path = self._run_eval(
-            request, preds_path, output_dir, run_dir, secret_values, cancel_token
-        )
+        eval_failures_path = output_dir / "eval_infrastructure_failures.json"
+        try:
+            result_path = self._run_eval(
+                request, preds_path, output_dir, run_dir, secret_values, cancel_token
+            )
+        finally:
+            if eval_failures_path.exists():
+                shutil.copy2(eval_failures_path, run_dir / eval_failures_path.name)
         shutil.copy2(result_path, run_dir / "swe_bench_results.json")
         return msgspec.json.decode(result_path.read_bytes(), type=dict)
 
@@ -477,6 +482,12 @@ class SweBenchRunner:
         if not isinstance(environment_cfg, dict):
             raise RunnerError("swebench template must define environment")
         self._configure_environment(environment_cfg, run_id)
+        if request.agent_command_timeout_s is not None:
+            environment_cfg["timeout"] = request.agent_command_timeout_s
+        if request.agent_create_timeout_s is not None:
+            environment_cfg["pull_timeout"] = request.agent_create_timeout_s
+        if request.model_request_timeout_s is not None:
+            model_kwargs["timeout"] = request.model_request_timeout_s
 
         config_dir.mkdir(parents=True, exist_ok=True)
         patched_path = config_dir / "swebench_patched.yaml"
@@ -865,15 +876,31 @@ class PyxisSweBenchRunner(SweBenchRunner):
                     str(self._shared_runtime_root),
                 ]
             )
-        self._run_logged_subprocess(
-            command,
-            run_dir / "swe_bench_agent.log",
-            cwd=output_dir,
-            timeout_s=self.subprocess_timeout_s,
-            env=self._base_env(request),
-            secret_values=secret_values,
-            cancel_token=cancel_token,
-        )
+        try:
+            self._run_logged_subprocess(
+                command,
+                run_dir / "swe_bench_agent.log",
+                cwd=output_dir,
+                timeout_s=self.subprocess_timeout_s,
+                env=self._base_env(request),
+                secret_values=secret_values,
+                cancel_token=cancel_token,
+            )
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            agent_error_path = run_dir / "agent_phase_error.txt"
+            atomic_write_bytes(
+                agent_error_path,
+                redact_text(str(exc), secret_values).encode(),
+            )
+            if not (output_dir / "preds.json").exists():
+                raise
+            logger.warning(
+                "Pyxis agent phase failed after producing predictions; continuing "
+                "with evaluation. Details are in %s",
+                agent_error_path,
+            )
 
     def _run_eval(
         self,
@@ -905,6 +932,8 @@ class PyxisSweBenchRunner(SweBenchRunner):
             self.image_registry,
             "--output-dir",
             str(output_dir),
+            "--timeout",
+            str(request.eval_timeout_s or 1800),
             "--srun-launch-grace-s",
             str(self.pyxis_srun_launch_grace_s),
         ]

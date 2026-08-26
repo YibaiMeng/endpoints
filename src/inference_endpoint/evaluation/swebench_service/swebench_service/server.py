@@ -32,6 +32,7 @@ from pydantic import ValidationError
 
 from . import API_VERSION, CAPABILITIES
 from .artifacts import (
+    SAFE_ARTIFACT_NAMES,
     atomic_write_bytes,
     redact_secrets,
     redact_text,
@@ -174,6 +175,7 @@ class RunManager:
                         run_id,
                         status="failed",
                         phase="failed",
+                        artifacts=self._existing_artifacts(run_id, run_dir),
                         error=redact_text(
                             str(exc), self._secret_values.get(run_id, set())
                         ),
@@ -189,24 +191,11 @@ class RunManager:
                     final_progress = await self._terminal_progress_async(
                         run_id, "succeeded"
                     )
-                    artifacts = [
-                        ArtifactInfo(
-                            name=name, url=f"/v1/runs/{run_id}/artifacts/{name}"
-                        )
-                        for name in (
-                            "preds.json",
-                            "swe_bench_agent.log",
-                            "swe_bench_eval.log",
-                            "swe_bench_results.json",
-                            "status.json",
-                        )
-                        if (run_dir / name).exists()
-                    ]
                     await self._transition(
                         run_id,
                         status="succeeded",
                         result=result,
-                        artifacts=artifacts,
+                        artifacts=self._existing_artifacts(run_id, run_dir),
                         **final_progress,
                     )
                 except Exception as exc:
@@ -214,6 +203,7 @@ class RunManager:
                         run_id,
                         status="failed",
                         phase="failed",
+                        artifacts=self._existing_artifacts(run_id, run_dir),
                         error=redact_text(
                             f"could not finalize SWE-bench run: {exc}",
                             self._secret_values.get(run_id, set()),
@@ -222,6 +212,14 @@ class RunManager:
         finally:
             self._tasks.pop(run_id, None)
             self._schedule_prune()
+
+    @staticmethod
+    def _existing_artifacts(run_id: str, run_dir: Path) -> list[ArtifactInfo]:
+        return [
+            ArtifactInfo(name=name, url=f"/v1/runs/{run_id}/artifacts/{name}")
+            for name in sorted(SAFE_ARTIFACT_NAMES)
+            if (run_dir / name).is_file()
+        ]
 
     async def cancel(self, run_id: str) -> RunStatus:
         status = await self.get(run_id)

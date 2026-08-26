@@ -234,6 +234,7 @@ def _run_eval(args: argparse.Namespace) -> None:
             }
         )
 
+    output_dir = args.output_dir.resolve()
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=args.max_workers
     ) as executor:
@@ -250,14 +251,28 @@ def _run_eval(args: argparse.Namespace) -> None:
             except Exception as exc:
                 with _PRINT_LOCK:
                     print(f"Pyxis evaluation failed: {exc}", flush=True)
-                failures.append(futures[future])
+                failures.append(
+                    {
+                        "instance_id": futures[future],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
         if failures:
-            raise RunnerError(
-                "Pyxis infrastructure failure evaluating: "
-                + ", ".join(sorted(failures))
+            atomic_write_bytes(
+                output_dir / "eval_infrastructure_failures.json",
+                (
+                    json.dumps(
+                        {
+                            "failures": sorted(
+                                failures, key=lambda item: item["instance_id"]
+                            )
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode(),
             )
 
-    output_dir = args.output_dir.resolve()
     with contextlib.chdir(output_dir):
         make_run_report(
             predictions,

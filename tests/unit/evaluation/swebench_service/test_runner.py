@@ -16,6 +16,7 @@ from typing import Literal, get_type_hints
 import msgspec.json
 import pytest
 import yaml
+
 from inference_endpoint.evaluation.swebench_service.swebench_service import (
     pyxis_environment as pyxis_environment_mod,
 )
@@ -253,6 +254,21 @@ def test_patch_config_keeps_api_key_out_of_yaml_and_forwards_generation(tmp_path
     assert model_kwargs["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_patch_config_applies_requested_timeouts(tmp_path):
+    request = _request(["http://endpoint:30000"])
+    request.agent_command_timeout_s = 600
+    request.agent_create_timeout_s = 7200
+    request.model_request_timeout_s = 7200
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    patched = runner._patch_config(tmp_path, request, run_id="run-1")
+
+    cfg = yaml.safe_load(patched.read_text())
+    assert cfg["environment"]["timeout"] == 600
+    assert cfg["environment"]["pull_timeout"] == 7200
+    assert cfg["model"]["model_kwargs"]["timeout"] == 7200
+
+
 def test_base_env_supplies_api_key_only_to_agent_subprocess(monkeypatch, tmp_path):
     runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
     authenticated = _request(["http://endpoint:30000"])
@@ -412,6 +428,63 @@ def _stub_successful_run(monkeypatch, runner: SweBenchRunner) -> None:
 
     monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
     monkeypatch.setattr(runner, "_run_eval", fake_run_eval)
+
+
+def test_run_copies_eval_failure_artifact(monkeypatch, tmp_path):
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    def fake_run_agent(
+        request, patched_config, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        (output_dir / "preds.json").write_text('{"repo__repo-1":"patch"}')
+
+    def fake_run_eval(
+        request, preds_path, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        (output_dir / "eval_infrastructure_failures.json").write_text(
+            '{"failures": []}\n'
+        )
+        result_path = output_dir / "result.json"
+        result_path.write_text('{"resolved_instances":1,"submitted_instances":1}')
+        return result_path
+
+    monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_run_eval", fake_run_eval)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    runner.run(_request(["http://endpoint:30000"]), tmp_path / "run-1")
+
+    assert (tmp_path / "run-1" / "eval_infrastructure_failures.json").read_text() == (
+        '{"failures": []}\n'
+    )
+
+
+def test_run_copies_eval_failure_artifact_when_report_fails(monkeypatch, tmp_path):
+    runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+
+    def fake_run_agent(
+        request, patched_config, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        (output_dir / "preds.json").write_text('{"repo__repo-1":"patch"}')
+
+    def fail_run_eval(
+        request, preds_path, output_dir, run_dir, secret_values, cancel_token=None
+    ):
+        (output_dir / "eval_infrastructure_failures.json").write_text(
+            '{"failures": ["repo__repo-1"]}\n'
+        )
+        raise RunnerError("report failed")
+
+    monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_run_eval", fail_run_eval)
+    monkeypatch.setattr(runner, "_cleanup_containers", lambda *args, **kwargs: None)
+
+    with pytest.raises(RunnerError, match="report failed"):
+        runner.run(_request(["http://endpoint:30000"]), tmp_path / "run-1")
+
+    assert (tmp_path / "run-1" / "eval_infrastructure_failures.json").read_text() == (
+        '{"failures": ["repo__repo-1"]}\n'
+    )
 
 
 def test_run_cleans_labeled_containers_after_success(monkeypatch, tmp_path):
@@ -1028,9 +1101,9 @@ def test_pyxis_retries_srun_launch_that_never_starts(monkeypatch, tmp_path):
     def fake_run(command, **kwargs):
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == 10:
             status_path.write_text("finished:0\n")
-        return subprocess.CompletedProcess(command, 139 if calls == 1 else 0, stdout="")
+        return subprocess.CompletedProcess(command, 139 if calls < 10 else 0, stdout="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(limits, "admit", fake_admit)
@@ -1045,7 +1118,7 @@ def test_pyxis_retries_srun_launch_that_never_starts(monkeypatch, tmp_path):
     )
 
     assert result.returncode == 0
-    assert calls == 2
+    assert calls == 10
     assert admissions == 1
     assert not failure_path.exists()
 
@@ -1814,6 +1887,33 @@ def test_pyxis_agent_requires_upstream_environment_hook(monkeypatch, tmp_path):
         worker_mod.main(_pyxis_agent_args(tmp_path))
 
 
+def test_pyxis_agent_preserves_predictions_after_failure(monkeypatch, tmp_path):
+    request = _pyxis_request()
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_registry=_PYXIS_IMAGE_REGISTRY,
+    )
+
+    def fail_after_predictions(command, log_path, **kwargs):
+        (tmp_path / "preds.json").write_text('{"repo__repo-1":"patch"}')
+        raise RunnerError("agent exited after producing predictions")
+
+    monkeypatch.setattr(runner_mod, "_run_subprocess", fail_after_predictions)
+
+    runner._run_agent(
+        request,
+        tmp_path / "config.yaml",
+        tmp_path,
+        tmp_path,
+        set(),
+    )
+
+    assert (tmp_path / "agent_phase_error.txt").read_text() == (
+        "agent exited after producing predictions"
+    )
+
+
 def test_pyxis_agent_restores_upstream_environment_hook(monkeypatch, tmp_path):
     original = object()
     swebench = types.SimpleNamespace(
@@ -1904,15 +2004,18 @@ def test_pyxis_eval_command_does_not_forward_model_key(monkeypatch, tmp_path):
         subprocess_timeout_s=30,
         image_registry=_PYXIS_IMAGE_REGISTRY,
     )
+    request = _pyxis_request()
+    request.eval_timeout_s = 3600
 
     result = runner._run_eval(
-        _pyxis_request(), preds_path, output_dir, run_dir, {"ambient-secret"}
+        request, preds_path, output_dir, run_dir, {"ambient-secret"}
     )
 
     command, kwargs = calls[0]
     assert command[1:4] == ["-m", "swebench_service.pyxis_worker", "eval"]
     assert command[command.index("--max-workers") + 1] == "2"
     assert command[command.index("--image-registry") + 1] == _PYXIS_IMAGE_REGISTRY
+    assert command[command.index("--timeout") + 1] == "3600"
     assert command[command.index("--instance-ids") + 1 :] == ["repo__repo-1"]
     assert "OPENAI_API_KEY" not in kwargs["env"]
     assert result.exists()
@@ -2153,7 +2256,7 @@ def test_pyxis_worker_uses_upstream_report(monkeypatch, tmp_path):
     ]
 
 
-def test_pyxis_worker_propagates_evaluation_infrastructure_failure(
+def test_pyxis_worker_retains_evaluation_infrastructure_failure(
     monkeypatch, tmp_path
 ):
     output_dir = tmp_path / "output"
@@ -2169,7 +2272,8 @@ def test_pyxis_worker_propagates_evaluation_infrastructure_failure(
     swebench = types.ModuleType("swebench")
     harness = types.ModuleType("swebench.harness")
     reporting = types.ModuleType("swebench.harness.reporting")
-    reporting.make_run_report = lambda *args, **kwargs: None
+    reports = []
+    reporting.make_run_report = lambda *args, **kwargs: reports.append(args)
     test_spec = types.ModuleType("swebench.harness.test_spec")
     test_spec_module = types.ModuleType("swebench.harness.test_spec.test_spec")
     test_spec_module.make_test_spec = lambda row, arch: types.SimpleNamespace(
@@ -2194,25 +2298,36 @@ def test_pyxis_worker_propagates_evaluation_infrastructure_failure(
         ),
     )
 
-    with pytest.raises(RunnerError, match="repo__repo-1"):
-        worker_mod.main(
-            [
-                "eval",
-                "--dataset-name",
-                "princeton-nlp/SWE-bench_Verified",
-                "--split",
-                "test",
-                "--predictions-path",
-                str(output_dir / "preds.json"),
-                "--max-workers",
-                "1",
-                "--run-id",
-                "endpoints_test",
-                "--image-registry",
-                _PYXIS_IMAGE_REGISTRY,
-                "--output-dir",
-                str(output_dir),
-                "--instance-ids",
-                "repo__repo-1",
-            ]
-        )
+    worker_mod.main(
+        [
+            "eval",
+            "--dataset-name",
+            "princeton-nlp/SWE-bench_Verified",
+            "--split",
+            "test",
+            "--predictions-path",
+            str(output_dir / "preds.json"),
+            "--max-workers",
+            "1",
+            "--run-id",
+            "endpoints_test",
+            "--image-registry",
+            _PYXIS_IMAGE_REGISTRY,
+            "--output-dir",
+            str(output_dir),
+            "--instance-ids",
+            "repo__repo-1",
+        ]
+    )
+
+    assert reports
+    assert json.loads(
+        (output_dir / "eval_infrastructure_failures.json").read_text()
+    ) == {
+        "failures": [
+            {
+                "instance_id": "repo__repo-1",
+                "error": "RunnerError: Pyxis infrastructure failure",
+            }
+        ]
+    }
